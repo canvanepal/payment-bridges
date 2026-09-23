@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Fonepay bridge">
+  <rect width="64" height="64" rx="15" fill="#0c1013"/>
+  <rect x="10" y="10" width="44" height="44" rx="11" fill="none" stroke="#2f9e88" stroke-width="3"/>
+  <path d="M25 24h15v5H31v5h8v5h-8v9h-6z" fill="#e4eaee"/>
+</svg>

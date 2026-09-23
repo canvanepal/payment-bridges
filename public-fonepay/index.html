@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Corporate console · Fonepay bridge</title>
+<meta name="description" content="Collections, settlements, QR codes and merchant hierarchy for a Fonepay corporate account, through a Cloudflare Worker bridge." />
+<meta name="theme-color" content="#0c1013" />
+<meta name="color-scheme" content="dark" />
+<meta name="robots" content="noindex" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" />
+<style>
+  :root {
+    --bg: #0c1013;
+    --panel: #12181d;
+    --panel-2: #0f1418;
+    --raise: #161e24;
+    --line: #1c242a;
+    --line-2: #2a353d;
+    --text: #e4eaee;
+    --muted: #8b9aa4;
+    --faint: #5d6b75;
+
+    --accent: #2f9e88;
+    --accent-dim: #16332d;
+    --accent-line: #2b6d5e;
+    --npr: #7fd7b6;
+
+    --ok: #3fae7c;
+    --warn: #d3a154;
+    --bad: #d0615a;
+
+    --shadow-sm: 0 1px 2px rgba(4, 12, 16, .55);
+    --shadow-md: 0 10px 26px -14px rgba(3, 10, 14, .75);
+    --shadow-lg: 0 28px 64px -28px rgba(3, 10, 14, .85);
+    --ring: 0 0 0 3px rgba(47, 158, 136, .28);
+
+    --r-lg: 14px;
+    --r-md: 10px;
+    --r-sm: 7px;
+
+    --sans: 'Geist', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13.5px/1.5 var(--sans); }
+  code, pre, textarea, input, select, .num { font-family: var(--mono); font-size: 12.5px; }
+  a { color: var(--accent); }
+  .skip { position: absolute; left: -9999px; }
+  .skip:focus { left: 10px; top: 10px; z-index: 100; background: var(--accent-dim); color: #fff; padding: 8px 12px; border-radius: 8px; }
+  :focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--r-sm); }
+
+  /* ---------- sign-in ---------- */
+  .gate { min-height: 100vh; display: grid; place-items: center; padding: 28px 18px; }
+  .gate .card { width: 100%; max-width: 470px; }
+  .gate h1 { font-size: 19px; margin: 0 0 4px; }
+  .gate .lede { color: var(--muted); font-size: 12.5px; margin-bottom: 16px; }
+  .brandline { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .brandline .mark {
+    width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--accent), #2b6d5e); font-weight: 700; font-size: 13px; color: #fff;
+  }
+  .brandline b { font-size: 13.5px; display: block; }
+  .brandline span { color: var(--muted); font-size: 11.5px; }
+
+  /* ---------- shell ---------- */
+  .shell { display: grid; grid-template-columns: 246px 1fr; min-height: 100vh; }
+  .sidebar {
+    background: linear-gradient(180deg, #101826, #0a0e14);
+    border-right: 1px solid var(--line);
+    padding: 14px 12px; display: flex; flex-direction: column; gap: 12px;
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+  .brand { display: flex; align-items: center; gap: 9px; padding: 2px 6px 10px; }
+  .brand .mark {
+    width: 28px; height: 28px; border-radius: 8px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #2b6d5e);
+    display: grid; place-items: center; font-weight: 700; font-size: 13px; color: #fff;
+  }
+  .brand b { font-size: 13px; display: block; line-height: 1.2; }
+  .brand span { color: var(--muted); font-size: 11px; }
+  nav { display: flex; flex-direction: column; gap: 2px; }
+  nav button {
+    all: unset; cursor: pointer; display: flex; align-items: center; gap: 9px;
+    padding: 7px 10px; border-radius: 7px; color: var(--muted); font-size: 13px;
+  }
+  nav button:hover { background: var(--raise); color: var(--text); }
+  nav button.active { background: var(--accent-dim); color: #fff; }
+  nav button .ic { width: 15px; text-align: center; opacity: .9; }
+  nav .group { padding: 12px 10px 5px; font-size: 10.5px; letter-spacing: .9px; text-transform: uppercase; color: #566274; }
+
+  .side-card { margin-top: auto; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); padding: 10px; font-size: 12px; }
+  .side-card .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+  .side-card .row span { color: var(--muted); }
+  .side-card .row b { font-weight: 500; font-family: var(--mono); font-size: 11.5px; }
+
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  header.top {
+    position: sticky; top: 0; z-index: 4;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 11px 18px; border-bottom: 1px solid var(--line);
+    background: rgba(11,15,20,.86); backdrop-filter: blur(8px);
+  }
+  header.top h1 { font-size: 14.5px; margin: 0; font-weight: 600; }
+  header.top .sub { color: var(--muted); font-size: 12px; }
+  header.top .sep { flex: 1; }
+  .content { padding: 16px 18px 40px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+  /* ---------- atoms ---------- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
+    border-radius: 999px; font-size: 11.5px; border: 1px solid var(--line-2);
+    background: var(--panel-2); color: var(--muted); white-space: nowrap;
+  }
+  .pill b { color: var(--text); font-weight: 600; }
+  .pill.ok { border-color: #1f4d38; color: #a9dfc4; }
+  .pill.warn { border-color: #4d3f1f; color: #e5cc9f; }
+  .pill.bad { border-color: #4d2220; color: #eaa9a4; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; }
+  .card > h2, .card > header {
+    margin: 0; padding: 10px 14px; font-size: 12.5px; font-weight: 600;
+    border-bottom: 1px solid var(--line); background: var(--panel-2);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .card > h2 .sub, .card > header .sub { color: var(--muted); font-weight: 400; font-size: 11.5px; }
+  .card .pad { padding: 14px; }
+  .grid { display: grid; gap: 12px; }
+  .grid.c2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .grid.c3 { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .grid.c4 { grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); }
+
+  button, .btn {
+    all: unset; cursor: pointer; padding: 7px 12px; border-radius: 8px;
+    border: 1px solid var(--line-2); background: var(--raise); color: var(--text);
+    font-size: 12.5px; text-align: center;
+  }
+  button:hover { border-color: var(--accent-line); }
+  button.primary { background: var(--accent-dim); border-color: var(--accent-line); color: #fff; }
+  button.danger { border-color: #4d2220; color: #eaa9a4; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+  input, select, textarea {
+    width: 100%; padding: 7px 9px; border-radius: 8px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--line-2);
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent-line); outline: none; box-shadow: var(--ring); }
+
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md); padding: 11px 13px; }
+  .stat .k { color: var(--muted); font-size: 11.5px; display: block; }
+  .stat .v { font-family: var(--mono); font-size: 18px; margin-top: 3px; }
+  .stat .v.money { color: var(--npr); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 11px; letter-spacing: .5px; text-transform: uppercase; color: var(--faint); font-weight: 500; }
+  tbody tr:hover { background: var(--raise); }
+  tbody tr.clickable { cursor: pointer; }
+  .scroll { overflow-x: auto; }
+  .num { text-align: right; }
+
+  pre { margin: 0; padding: 12px; background: var(--panel-2); border-radius: var(--r-sm); overflow: auto; max-height: 420px; color: #cfe3dd; }
+  details { border-top: 1px solid var(--line); }
+  details > summary { cursor: pointer; padding: 8px 12px; color: var(--muted); font-size: 12px; }
+  details[open] > summary { color: var(--text); }
+  details > pre { margin: 0 12px 12px; }
+
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); }
+  .empty { padding: 18px; color: var(--muted); font-size: 12.5px; text-align: center; }
+  .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .row > div { flex: 1 1 150px; min-width: 130px; }
+  .row > div.tight { flex: 0 0 auto; }
+  .tag { font-family: var(--mono); font-size: 11px; padding: 2px 7px; border-radius: 6px; background: var(--raise); border: 1px solid var(--line-2); color: var(--muted); }
+  .banner {
+    display: flex; gap: 9px; align-items: flex-start; padding: 10px 12px; border-radius: var(--r-md);
+    border: 1px solid var(--line-2); background: var(--panel-2); font-size: 12.5px;
+  }
+  .banner.bad { border-color: #4d2220; background: #1a1213; color: #f0c2be; }
+  .banner.ok { border-color: #1f4d38; background: #0f1a16; color: #bfe6d3; }
+  .banner.warn { border-color: #4d3f1f; background: #191408; color: #ecd6ab; }
+
+  #toast {
+    position: fixed; right: 16px; bottom: 16px; z-index: 60; display: flex; flex-direction: column; gap: 8px;
+  }
+  #toast div {
+    background: var(--raise); border: 1px solid var(--line-2); border-left: 3px solid var(--accent);
+    padding: 9px 12px; border-radius: var(--r-sm); box-shadow: var(--shadow-md); font-size: 12.5px; max-width: 380px;
+  }
+  #toast div.bad { border-left-color: var(--bad); }
+
+  .qrwrap { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .qrimg { background: #fff; padding: 10px; border-radius: var(--r-md); line-height: 0; }
+  .qrimg svg { width: 220px; height: 220px; display: block; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; word-break: break-all; }
+
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; }
+    .sidebar { position: static; height: auto; }
+  }
+</style>
+</head>
+<body>
+<a class="skip" href="#view">Skip to content</a>
+<div id="app"></div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="/vendor/qrcode.js"></script>
+<script src="/vendor/qrcode-utf8.js"></script>
+<script>
+/* ------------------------------------------------------------------ *
+ * Fonepay bridge console.
+ *
+ * Talks only to this Worker's own /api. The session token is opaque, is
+ * refreshed automatically when the Worker re-signs in, and never exposes the
+ * Fonepay access token to the page.
+ * ------------------------------------------------------------------ */
+
+const S = {
+  token: sessionStorage.getItem('fp_session') || '',
+  user: safeJson(sessionStorage.getItem('fp_user')) || null,
+  route: (location.hash || '').replace('#', '') || 'overview',
+  hierarchy: null,
+  calls: 0,
+};
+
+function safeJson(value) {
+  try { return value ? JSON.parse(value) : null; } catch { return null; }
+}
+function esc(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+const $ = (id) => document.getElementById(id);
+function money(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return 'NPR ' + n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function today() {
+  // Local date, not UTC: a UTC "today" is a day behind for most of the Nepali evening.
+  const d = new Date();
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+}
+function daysAgo(n) {
+  const d = new Date(Date.now() - n * 86400000);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+}
+function toast(message, bad) {
+  const node = document.createElement('div');
+  if (bad) node.className = 'bad';
+  node.textContent = message;
+  $('toast').appendChild(node);
+  setTimeout(() => node.remove(), 5200);
+}
+
+/* ------------------------- transport ------------------------- */
+
+async function api(path, options) {
+  const opts = options || {};
+  const headers = { Accept: 'application/json' };
+  if (S.token) headers.Authorization = 'Bearer ' + S.token;
+  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+
+  S.calls += 1;
+  let response;
+  try {
+    response = await fetch('/api' + path, {
+      method: opts.method || (opts.body === undefined ? 'GET' : 'POST'),
+      headers,
+      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+    });
+  } catch (error) {
+    throw Object.assign(new Error('Could not reach the bridge: ' + error.message), { code: 'NETWORK' });
+  }
+
+  // The Worker slides the session forward whenever it renews upstream.
+  const slid = response.headers.get('X-Session-Token');
+  if (slid) {
+    S.token = slid;
+    sessionStorage.setItem('fp_session', slid);
+  }
+
+  const raw = await response.text();
+  let payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch { payload = { message: raw }; }
+
+  if (!response.ok) {
+    if (response.status === 401 && opts.allow401 !== true) {
+      signOut(true);
+    }
+    const error = new Error((payload && payload.message) || ('HTTP ' + response.status));
+    error.code = payload && payload.code;
+    error.status = response.status;
+    error.data = payload && payload.data;
+    error.payload = payload;
+    throw error;
+  }
+
+  return payload;
+}
+
+function signOut(silent) {
+  S.token = '';
+  S.user = null;
+  S.hierarchy = null;
+  sessionStorage.removeItem('fp_session');
+  sessionStorage.removeItem('fp_user');
+  renderGate();
+  if (!silent) toast('Signed out.');
+}
+
+/* ------------------------- sign-in gate ------------------------- */
+
+function renderGate(message) {
+  document.title = 'Corporate console · Fonepay bridge';
+  $('app').innerHTML =
+    '<div class="gate"><div class="card"><header><div class="brandline">' +
+      '<span class="mark">FP</span><span><b>Fonepay corporate bridge</b>' +
+      '<span>Cloudflare Worker · session stays server-side</span></span></div></header>' +
+    '<div class="pad">' +
+      (message ? '<div class="banner bad" style="margin-bottom:12px">' + esc(message) + '</div>' : '') +
+      '<div class="row"><div><label for="gUser">Username or email</label>' +
+        '<input id="gUser" autocomplete="username" placeholder="98xxxxxxxx or name@example.com" /></div>' +
+        '<div class="tight"><button onclick="lookup()" id="gLookup">Look up</button></div></div>' +
+      '<div id="gOptions" style="margin-top:10px"></div>' +
+      '<div style="margin-top:10px"><label for="gPass">Password</label>' +
+        '<input id="gPass" type="password" autocomplete="current-password" /></div>' +
+      '<div style="margin-top:10px"><label for="gCode">Corporate code <span class="faint">(optional — looked up if blank)</span></label>' +
+        '<input id="gCode" placeholder="e.g. 1000001" /></div>' +
+      '<div class="row" style="margin-top:14px"><div class="tight">' +
+        '<button class="primary" id="gSubmit" onclick="signIn()">Sign in</button></div>' +
+        '<div class="tight"><button onclick="document.getElementById(\'gPass\').value=\'\'">Clear</button></div>' +
+      '</div>' +
+      '<div class="muted" style="margin-top:14px;font-size:12px">' +
+        'The bridge signs in to <code>corporate-kong.fonepay.com</code> on your behalf and hands back an ' +
+        'opaque session token. Your password is never returned to this page.</div>' +
+      '<details style="margin-top:12px;border-top:1px solid var(--line);padding-top:8px">' +
+        '<summary>What this bridge does and does not do</summary>' +
+        '<div class="muted" style="font-size:12px;padding:0 12px 12px">' +
+        'It re-signs-in automatically when the Fonepay token expires, because Fonepay has no refresh endpoint. ' +
+        'That means the credentials are kept inside the sealed session token — encrypted with the Worker secret, ' +
+        'never readable by this page. Set <code>FONEPAY_RENEW_ON_EXPIRY=0</code> to disable it.</div>' +
+      '</details>' +
+    '</div></div></div>';
+
+  $('gPass').addEventListener('keydown', (event) => { if (event.key === 'Enter') signIn(); });
+  $('gUser').addEventListener('keydown', (event) => { if (event.key === 'Enter') lookup(); });
+}
+
+async function lookup() {
+  const emailOrUsername = $('gUser').value.trim();
+  if (!emailOrUsername) return toast('Enter a username or email first.', true);
+
+  $('gLookup').disabled = true;
+  $('gOptions').innerHTML = '<div class="muted" style="font-size:12px">Looking up corporate accounts…</div>';
+  try {
+    const result = await api('/auth/lookup', { body: { emailOrUsername } });
+    const data = result.data || {};
+    if (!data.emailExists) {
+      $('gOptions').innerHTML = '<div class="banner warn">' + esc(data.message || 'That identifier is not registered.') + '</div>';
+      return;
+    }
+    const options = Array.isArray(data.corporateOptions) ? data.corporateOptions : [];
+    if (options.length === 0) {
+      $('gOptions').innerHTML = '<div class="banner warn">No active corporate accounts for that identifier.</div>';
+      return;
+    }
+    if (options.length === 1) {
+      const code = options[0].corporateCode || options[0].code || '';
+      $('gCode').value = code;
+      $('gOptions').innerHTML = '<div class="banner ok">Corporate: <b>' + esc(options[0].corporateName || options[0].name || code) + '</b> <span class="tag">' + esc(code) + '</span></div>';
+      return;
+    }
+    $('gOptions').innerHTML = '<label>Choose a corporate</label><select id="gPick" onchange="document.getElementById(\'gCode\').value=this.value">' +
+      options.map((option) => {
+        const code = option.corporateCode || option.code || '';
+        return '<option value="' + esc(code) + '">' + esc((option.corporateName || option.name || 'Corporate') + ' · ' + code) + '</option>';
+      }).join('') + '</select>';
+    $('gCode').value = options[0].corporateCode || options[0].code || '';
+  } catch (error) {
+    $('gOptions').innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+  } finally {
+    $('gLookup').disabled = false;
+  }
+}
+
+async function signIn() {
+  const emailOrUsername = $('gUser').value.trim();
+  const password = $('gPass').value;
+  const corporateCode = $('gCode').value.trim();
+  if (!emailOrUsername || !password) return toast('Username and password are required.', true);
+
+  $('gSubmit').disabled = true;
+  $('gSubmit').textContent = 'Signing in…';
+  try {
+    const result = await api('/auth/login', { body: { emailOrUsername, password, corporateCode }, allow401: true });
+    S.token = result.data.session;
+    S.user = result.data.user;
+    sessionStorage.setItem('fp_session', S.token);
+    sessionStorage.setItem('fp_user', JSON.stringify(S.user));
+    toast('Signed in as ' + (S.user.displayName || S.user.username) + '.');
+    render();
+  } catch (error) {
+    if (error.code === 'OTP_REQUIRED') {
+      renderOtp(error.data);
+      return;
+    }
+    if (error.code === 'CORPORATE_SELECTION_REQUIRED') {
+      const options = (error.data && error.data.corporateOptions) || [];
+      if (options.length) {
+        S.pendingCredentials = { emailOrUsername, password };
+        $('gOptions').innerHTML = '<label>Choose a corporate</label><select id="gPick" onchange="document.getElementById(\'gCode\').value=this.value">' +
+          options.map((option) => {
+            const code = option.corporateCode || option.code || '';
+            return '<option value="' + esc(code) + '">' + esc((option.corporateName || option.name || 'Corporate') + ' · ' + code) + '</option>';
+          }).join('') + '</select>';
+        $('gCode').value = options[0].corporateCode || options[0].code || '';
+        toast('This identifier belongs to several corporates — pick one and sign in again.', true);
+        return;
+      }
+    }
+    renderGate(error.message);
+    toast(error.message, true);
+  } finally {
+    const button = $('gSubmit');
+    if (button) { button.disabled = false; button.textContent = 'Sign in'; }
+  }
+}
+
+function renderOtp(data) {
+  $('app').innerHTML =
+    '<div class="gate"><div class="card"><header>One-time code required</header><div class="pad">' +
+      '<div class="banner warn" style="margin-bottom:12px">Fonepay wants a <b>' + esc((data && data.otpType) || 'OTP') +
+      '</b> code for this account before the session is usable.</div>' +
+      '<label for="otpCode">Code</label><input id="otpCode" inputmode="numeric" autocomplete="one-time-code" />' +
+      '<div class="row" style="margin-top:12px"><div class="tight">' +
+        '<button class="primary" onclick="submitOtp()">Verify</button></div>' +
+        '<div class="tight"><button onclick="renderGate()">Back</button></div></div>' +
+      '<details style="margin-top:12px"><summary>Raw response</summary><pre>' + esc(JSON.stringify(data, null, 2)) + '</pre></details>' +
+    '</div></div></div>';
+  S.pending = data && data.pendingSession;
+}
+
+async function submitOtp() {
+  const otpCode = $('otpCode').value.trim();
+  if (!otpCode) return toast('Enter the code.', true);
+  if (!S.pending) return renderGate('The pending session expired. Sign in again.');
+
+  try {
+    const result = await api('/auth/otp', { body: { session: S.pending, otpCode }, allow401: true });
+    S.token = result.data.session;
+    S.user = result.data.user;
+    S.pending = '';
+    sessionStorage.setItem('fp_session', S.token);
+    sessionStorage.setItem('fp_user', JSON.stringify(S.user));
+    toast('Signed in.');
+    render();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+/* ------------------------- shell ------------------------- */
+
+const NAV = [
+  { group: 'Collections' },
+  { id: 'overview', label: 'Overview', icon: '◱' },
+  { id: 'transactions', label: 'Transactions', icon: '≡' },
+  { id: 'settlements', label: 'Settlements', icon: '⧉' },
+  { id: 'qr', label: 'QR codes', icon: '▣' },
+  { group: 'Account' },
+  { id: 'merchants', label: 'Merchants', icon: '⌂' },
+  { id: 'users', label: 'Users & profile', icon: '☺' },
+  { id: 'api', label: 'API & session', icon: '{}' },
+];
+
+const TITLES = {
+  overview: ['Overview', 'Today at a glance'],
+  transactions: ['Transactions', 'Collection transactions for a date range'],
+  settlements: ['Settlements', 'Settlement report for a date range'],
+  qr: ['QR codes', 'Static and dynamic Fonepay QR'],
+  merchants: ['Merchants', 'Linked merchants, hierarchy and access'],
+  users: ['Users & profile', 'Corporate users and the signed-in profile'],
+  api: ['API & session', 'Routes this bridge exposes, and session state'],
+};
+
+function render() {
+  if (!S.token) return renderGate();
+
+  const [title, sub] = TITLES[S.route] || TITLES.overview;
+  document.title = title + ' · Fonepay bridge';
+
+  $('app').innerHTML =
+    '<div class="shell">' +
+      '<aside class="sidebar">' +
+        '<div class="brand"><span class="mark">FP</span><span><b>Fonepay bridge</b>' +
+          '<span>corporate-kong</span></span></div>' +
+        '<nav aria-label="Sections">' +
+          NAV.map((item) => item.group
+            ? '<div class="group">' + esc(item.group) + '</div>'
+            : '<button data-route="' + item.id + '" onclick="go(\'' + item.id + '\')" aria-current="' +
+              (S.route === item.id ? 'page' : 'false') + '"><span class="ic">' + item.icon + '</span>' + esc(item.label) + '</button>'
+          ).join('') +
+        '</nav>' +
+        '<div class="side-card">' +
+          '<div class="row"><span>User</span><b>' + esc((S.user && S.user.displayName) || '—') + '</b></div>' +
+          '<div class="row"><span>Corporate</span><b>' + esc((S.user && S.user.corporateCode) || '—') + '</b></div>' +
+          '<div class="row"><span>Merchants</span><b>' + esc(S.user && S.user.linkedMerchants ? S.user.linkedMerchants.length : 0) + '</b></div>' +
+          '<div class="row"><span>Session</span><b>' + (S.token ? 'active' : '—') + '</b></div>' +
+          '<div class="row"><span>Auto-renew</span><b>' + (S.user && S.user.autoRenew === false ? 'off' : 'on') + '</b></div>' +
+          '<div style="display:flex;gap:6px;margin-top:9px">' +
+            '<button onclick="go(\'api\')" style="flex:1">Details</button>' +
+            '<button class="danger" onclick="signOut()" style="flex:1">Sign out</button>' +
+          '</div>' +
+        '</div>' +
+      '</aside>' +
+      '<div class="main">' +
+        '<header class="top"><h1>' + esc(title) + '</h1><span class="sub">' + esc(sub) + '</span>' +
+          '<span class="sep"></span>' +
+          '<span class="pill ok"><b>' + esc(S.user ? (S.user.corporateCode || '') : '') + '</b> corporate</span>' +
+          '<button onclick="reload()">Refresh</button>' +
+        '</header>' +
+        '<main class="content" id="view"></main>' +
+      '</div>' +
+    '</div>';
+
+  const view = VIEWS[S.route] || VIEWS.overview;
+  view($('view')).catch((error) => {
+    $('view').innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+  });
+}
+
+function go(route) {
+  S.route = route;
+  history.replaceState(null, '', '#' + route);
+  render();
+}
+
+function reload() {
+  if (!S.token) return renderGate();
+  const view = VIEWS[S.route] || VIEWS.overview;
+  const target = $('view');
+  if (!target) return render();
+  target.innerHTML = '<div class="empty">Reloading…</div>';
+  view(target).catch((error) => {
+    target.innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+  });
+}
+
+function section(title, extra) {
+  return '<section class="card"><h2>' + esc(title) + (extra ? ' <span class="sub">' + esc(extra) + '</span>' : '') + '</h2>';
+}
+
+function rawBlock(data) {
+  return '<details><summary>Raw JSON</summary><pre>' + esc(JSON.stringify(data, null, 2)) + '</pre></details>';
+}
+
+/** The hierarchy the portal itself uses for its filter tree. */
+async function hierarchy() {
+  if (S.hierarchy) return S.hierarchy;
+  const result = await api('/transactions/hierarchy');
+  const merchants = (result.data && result.data.merchants) || [];
+  const flat = [];
+  for (const merchant of merchants) {
+    const subs = (merchant.hierarchy && merchant.hierarchy.subMerchants) || [];
+    for (const sub of subs) {
+      for (const terminal of sub.terminals || []) {
+        flat.push({
+          merchantId: String(merchant.linkedMerchantId),
+          merchantName: merchant.merchantNickname || '',
+          subMerchantId: String(sub.id),
+          subMerchantName: sub.name || '',
+          terminalId: String(terminal.id),
+          terminalName: terminal.name || '',
+          terminalPan: terminal.fonepayPan || '',
+        });
+      }
+    }
+  }
+  S.hierarchy = { merchants, flat, defaultMerchantId: (result.data && result.data.defaultMerchantId) || null };
+  return S.hierarchy;
+}
+
+function terminalOptions(h, selectedTerminalId) {
+  return h.flat.map((row) =>
+    '<option value="' + esc(row.terminalId) + '" data-merchant="' + esc(row.merchantId) + '" data-sub="' + esc(row.subMerchantId) + '"' +
+    (String(row.terminalId) === String(selectedTerminalId || '') ? ' selected' : '') + '>' +
+    esc(row.merchantName + ' · ' + row.terminalName + ' (' + row.terminalId + ')') + '</option>').join('');
+}
+
+/* ------------------------- views ------------------------- */
+
+const VIEWS = {};
+
+/* --- overview --- */
+VIEWS.overview = async (root) => {
+  const from = daysAgo(6);
+  const to = today();
+  const [summary, recent] = await Promise.all([
+    api('/transactions/summary', { body: { fromTransmissionDateTime: from, toTransmissionDateTime: to } }),
+    api('/transactions', { body: { fromTransmissionDateTime: from, toTransmissionDateTime: to, page: 0, size: 10 } }),
+  ]);
+
+  const s = summary.data || {};
+  const list = (recent.data && recent.data.content) || [];
+
+  root.innerHTML =
+    '<div class="grid c4">' +
+      stat('Collected · ' + from + ' → ' + to, money(s.totalAmount), true) +
+      stat('Transactions', s.totalElements === undefined ? '—' : s.totalElements) +
+      stat('Charges', money(s.charge)) +
+      stat('Net', money(s.netAmount)) +
+      stat('Pages in last call', recent.data && recent.data.totalPages !== undefined ? recent.data.totalPages : '—') +
+    '</div>' +
+    section('Recent transactions', from + ' → ' + to) +
+      (list.length ? transactionsTable(list) : '<div class="empty">No collections in this window.</div>') +
+      rawBlock(recent) +
+    '</section>' +
+    '<div class="banner">Fonepay answers successful reads with <b>HTTP 202</b> and an envelope of ' +
+      '<code>{message, code:"0", isSuccess:true, data}</code>. The bridge passes that through unchanged.</div>';
+};
+
+function stat(key, value, isMoney) {
+  return '<div class="stat"><span class="k">' + esc(key) + '</span>' +
+    '<span class="v' + (isMoney ? ' money' : '') + '">' + esc(value) + '</span></div>';
+}
+
+function transactionsTable(list) {
+  return '<div class="scroll"><table><thead><tr>' +
+    '<th>Transaction</th><th>When</th><th>Merchant</th><th class="num">Amount</th>' +
+    '<th>Payment</th><th>Settlement</th></tr></thead><tbody>' +
+    list.map((txn) => '<tr>' +
+      '<td class="num">' + esc(txn.transactionId) + '</td>' +
+      '<td>' + esc(txn.localTransactionDate || txn.transactionDate) + '</td>' +
+      '<td>' + esc(txn.merchantNickname || txn.merchantId) + '</td>' +
+      '<td class="num">' + esc(money(txn.amount)) + '</td>' +
+      '<td>' + statusPill(txn.paymentStatus) + '</td>' +
+      '<td>' + statusPill(txn.settlementStatus) + '</td>' +
+    '</tr>').join('') +
+    '</tbody></table></div>';
+}
+
+function statusPill(value) {
+  if (!value) return '<span class="muted">—</span>';
+  const text = String(value);
+  const cls = /success|settled|complete|active/i.test(text) ? 'ok'
+    : /pending|progress|partial/i.test(text) ? 'warn' : /fail|reject|reverse/i.test(text) ? 'bad' : '';
+  return '<span class="pill ' + cls + '">' + esc(text) + '</span>';
+}
+
+/* --- transactions --- */
+VIEWS.transactions = async (root) => {
+  const h = await hierarchy().catch(() => ({ flat: [], merchants: [] }));
+
+  root.innerHTML =
+    section('Filters', 'page and size are query parameters upstream') +
+      '<div class="pad"><div class="row">' +
+        field('txFrom', 'From', 'date', daysAgo(6)) +
+        field('txTo', 'To', 'date', today()) +
+        '<div><label for="txTerminal">Terminal</label><select id="txTerminal">' +
+          '<option value="">All terminals</option>' + terminalOptions(h) + '</select></div>' +
+        '<div class="tight"><label for="txSize">Size</label><select id="txSize">' +
+          ['10', '25', '50', '100'].map((n) => '<option' + (n === '25' ? ' selected' : '') + '>' + n + '</option>').join('') +
+        '</select></div>' +
+        '<div class="tight"><button class="primary" onclick="loadTransactions(0)">Search</button></div>' +
+      '</div></div>' +
+    '</section>' +
+    '<section class="card" id="txOut"><div class="empty">Run a search to load collections.</div></section>';
+
+  await loadTransactions(0);
+};
+
+function field(id, label, type, value, placeholder) {
+  return '<div><label for="' + id + '">' + esc(label) + '</label>' +
+    '<input id="' + id + '" type="' + (type || 'text') + '" value="' + esc(value || '') + '"' +
+    (placeholder ? ' placeholder="' + esc(placeholder) + '"' : '') + ' /></div>';
+}
+
+async function loadTransactions(page) {
+  const out = $('txOut');
+  out.innerHTML = '<div class="empty">Loading…</div>';
+
+  const terminal = $('txTerminal').selectedOptions[0];
+  const body = {
+    fromTransmissionDateTime: $('txFrom').value,
+    toTransmissionDateTime: $('txTo').value,
+    page: page,
+    size: Number($('txSize').value),
+  };
+  if (terminal && terminal.value) {
+    body.merchantId = terminal.dataset.merchant;
+    body.subMerchantId = terminal.dataset.sub;
+    body.terminalId = terminal.value;
+  }
+
+  try {
+    const result = await api('/transactions', { body });
+    const data = result.data || {};
+    const list = data.content || [];
+    const pages = data.totalPages || 1;
+
+    out.innerHTML =
+      '<h2>Transactions <span class="sub">' + esc((data.totalElements === undefined ? list.length : data.totalElements) +
+        ' in range · page ' + (page + 1) + ' of ' + pages + ' · total ' + money(data.totalAmount)) + '</span></h2>' +
+      (list.length ? transactionsTable(list) : '<div class="empty">Nothing in this window.</div>') +
+      '<div class="pad row" style="justify-content:space-between">' +
+        '<div class="tight"><button ' + (page <= 0 ? 'disabled' : '') + ' onclick="loadTransactions(' + (page - 1) + ')">‹ Newer</button></div>' +
+        '<div class="tight"><button ' + (page + 1 >= pages ? 'disabled' : '') + ' onclick="loadTransactions(' + (page + 1) + ')">Older ›</button></div>' +
+      '</div>' +
+      rawBlock(result);
+  } catch (error) {
+    out.innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+  }
+}
+
+/* --- settlements --- */
+VIEWS.settlements = async (root) => {
+  root.innerHTML =
+    section('Filters') +
+      '<div class="pad"><div class="row">' +
+        field('stFrom', 'From settlement date', 'date', daysAgo(30)) +
+        field('stTo', 'To settlement date', 'date', today()) +
+        '<div class="tight"><button class="primary" onclick="loadSettlements()">Search</button></div>' +
+      '</div></div>' +
+    '</section>' +
+    '<section class="card" id="stOut"><div class="empty">Run a search to load the settlement report.</div></section>';
+
+  await loadSettlements();
+};
+
+async function loadSettlements() {
+  const out = $('stOut');
+  out.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const result = await api('/settlements', {
+      body: { fromSettlementDate: $('stFrom').value, toSettlementDate: $('stTo').value, pageNumber: 1, pageSize: 25 },
+    });
+    const data = result.data || {};
+    const rows = data.searchedDataList || [];
+    out.innerHTML =
+      '<h2>Settlements <span class="sub">' + esc((data.totalCount === undefined ? rows.length : data.totalCount) + ' found · ' +
+        ((data.searchExtraResponse && data.searchExtraResponse.settlementType) || 'untyped')) + '</span></h2>' +
+      (rows.length
+        ? '<div class="scroll"><table><thead><tr>' +
+            Object.keys(rows[0]).slice(0, 8).map((key) => '<th>' + esc(key) + '</th>').join('') +
+          '</tr></thead><tbody>' +
+          rows.map((row) => '<tr>' + Object.keys(rows[0]).slice(0, 8).map((key) =>
+            '<td>' + esc(typeof row[key] === 'object' ? JSON.stringify(row[key]) : row[key]) + '</td>').join('') + '</tr>').join('') +
+          '</tbody></table></div>'
+        : '<div class="empty">No settlements in that window.</div>') +
+      rawBlock(result);
+  } catch (error) {
+    out.innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+  }
+}
+
+/* --- QR --- */
+VIEWS.qr = async (root) => {
+  const h = await hierarchy().catch(() => ({ flat: [] }));
+
+  root.innerHTML =
+    '<div class="grid c2">' +
+      '<section class="card"><h2>Static QR <span class="sub">per terminal</span></h2><div class="pad">' +
+        '<label for="qrStation">Terminal</label><select id="qrStation">' + terminalOptions(h) + '</select>' +
+        '<div class="row" style="margin-top:12px"><div class="tight"><button class="primary" onclick="generateQr(\'static\')">Generate</button></div></div>' +
+      '</div><div id="qrStaticOut"><div class="empty">A static QR identifies the terminal and never expires.</div></div></section>' +
+      '<section class="card"><h2>Dynamic QR <span class="sub">bound to an amount</span></h2><div class="pad">' +
+        '<div class="row">' + field('qrAmount', 'Amount (NPR)', 'number', '1') + field('qrOrder', 'Order id', 'text', 'INV-1') + '</div>' +
+        '<div style="margin-top:10px"><label for="qrRemarks">Remarks</label>' +
+          '<input id="qrRemarks" value="Test payment" /></div>' +
+        '<div style="margin-top:12px"><label for="qrStation2">Terminal</label><select id="qrStation2">' + terminalOptions(h) + '</select></div>' +
+        '<div class="row" style="margin-top:12px"><div class="tight"><button class="primary" onclick="generateQr(\'dynamic\')">Generate</button></div></div>' +
+      '</div><div id="qrDynamicOut"><div class="empty">The dynamic QR carries the amount and an order reference.</div></div></section>' +
+    '</div>' +
+    '<div class="banner">Fonepay returns the EMV payload itself (<code>qrString</code> / <code>qrMessage</code>), ' +
+      'not an image. This page renders it locally with a vendored MIT-licensed encoder — ' +
+      'the payload never leaves the browser.</div>';
+};
+
+async function generateQr(kind) {
+  const out = kind === 'static' ? $('qrStaticOut') : $('qrDynamicOut');
+  const select = kind === 'static' ? $('qrStation') : $('qrStation2');
+  const option = select.selectedOptions[0];
+  if (!option || !option.value) return toast('Pick a terminal first.', true);
+
+  out.innerHTML = '<div class="empty">Generating…</div>';
+
+  const body = {
+    merchantId: option.dataset.merchant,
+    subMerchantId: option.dataset.sub ? Number(option.dataset.sub) : undefined,
+    terminalId: Number(option.value),
+  };
+  if (kind === 'dynamic') {
+    body.amount = Number($('qrAmount').value || 0);
+    body.orderId = $('qrOrder').value;
+    body.remarks = $('qrRemarks').value;
+  }
+
+  try {
+    const result = await api(kind === 'static' ? '/qr/static' : '/qr/dynamic', { body });
+    const data = result.data || {};
+    const payload = data.qrMessage || data.qrString || '';
+    out.innerHTML =
+      '<div class="pad qrwrap">' +
+        '<div class="qrimg">' + qrSvg(payload) + '</div>' +
+        '<div style="flex:1 1 240px;min-width:220px">' +
+          '<dl class="kv">' +
+            '<dt>Merchant</dt><dd>' + esc(data.merchantId || '—') + '</dd>' +
+            '<dt>Terminal</dt><dd>' + esc(data.terminalName || data.terminalId || '—') + '</dd>' +
+            '<dt>Location</dt><dd>' + esc(data.location || '—') + '</dd>' +
+            '<dt>PAN</dt><dd>' + esc(data.fonepayPanNumber || '—') + '</dd>' +
+            (data.amount !== undefined ? '<dt>Amount</dt><dd>' + esc(money(data.amount)) + '</dd>' : '') +
+            (data.remarks ? '<dt>Remarks</dt><dd>' + esc(data.remarks) + '</dd>' : '') +
+            (data.websocketId ? '<dt>Settlement stream</dt><dd>' + esc(data.websocketId) + '</dd>' : '') +
+          '</dl>' +
+          '<div class="row" style="margin-top:10px"><div class="tight">' +
+            '<button onclick="copyText(' + JSON.stringify(payload).replace(/"/g, '&quot;') + ')">Copy payload</button>' +
+          '</div></div>' +
+        '</div>' +
+      '</div>' +
+      rawBlock(result);
+  } catch (error) {
+    out.innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+  }
+}
+
+function qrSvg(payload) {
+  try {
+    const code = qrcode(0, 'M');
+    code.addData(payload);
+    code.make();
+    return code.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+  } catch (error) {
+    return '<div class="muted" style="padding:12px;color:#333">Could not render QR: ' + esc(error.message) + '</div>';
+  }
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(
+    () => toast('Payload copied.'),
+    () => toast('Could not copy — select the payload manually.', true),
+  );
+}
+
+/* --- merchants --- */
+VIEWS.merchants = async (root) => {
+  const [linked, access, pending] = await Promise.all([
+    api('/merchants').catch((error) => ({ error })),
+    api('/merchants/access').catch((error) => ({ error })),
+    api('/merchants/pending-count').catch((error) => ({ error })),
+  ]);
+
+  const linkedRows = (linked.data || []).map((merchant) => merchant);
+  const accessRows = (access.data || []).map((merchant) => merchant);
+  const counts = pending.data || {};
+
+  root.innerHTML =
+    '<div class="grid c3">' +
+      stat('Linked merchants', linkedRows.length) +
+      stat('Accessible merchants', accessRows.length) +
+      stat('Pending approvals', counts.totalPending === undefined ? '—' : counts.totalPending) +
+    '</div>' +
+    section('Linked merchants', 'the accounts you can collect for') +
+      (linkedRows.length
+        ? '<div class="scroll"><table><thead><tr><th>Id</th><th>Merchant</th><th>PAN</th><th>Status</th><th class="num">Collected</th></tr></thead><tbody>' +
+          linkedRows.map((merchant) =>
+            '<tr class="clickable" onclick="loadHierarchy(\'' + esc(merchant.id) + '\')">' +
+              '<td class="num">' + esc(merchant.id) + '</td>' +
+              '<td>' + esc(merchant.merchantName || merchant.merchantNickname) + '</td>' +
+              '<td>' + esc(merchant.fonepayPan) + '</td>' +
+              '<td>' + statusPill(merchant.status) + '</td>' +
+              '<td class="num">' + esc(money(merchant.totalCollections)) + '</td>' +
+            '</tr>').join('') + '</tbody></table></div>' +
+          '<div class="muted" style="padding:8px 14px;font-size:12px">Click a row to open its hierarchy.</div>'
+        : '<div class="empty">No linked merchants.</div>') +
+      rawBlock(linked) +
+    '</section>' +
+    '<section class="card" id="mhOut"><div class="empty">Select a merchant to see its sub-merchants and terminals.</div></section>' +
+    section('Merchant access', 'who else can see these merchants') +
+      (accessRows.length
+        ? '<div class="scroll"><table><thead><tr><th>Linked id</th><th>Merchant</th><th>PAN</th><th>Level</th></tr></thead><tbody>' +
+          accessRows.map((row) => '<tr><td class="num">' + esc(row.linkedMerchantId) + '</td><td>' + esc(row.merchantName) +
+            '</td><td>' + esc(row.fonepayPan) + '</td><td>' + statusPill(row.highestAccessLevel) + '</td></tr>').join('') +
+          '</tbody></table></div>'
+        : '<div class="empty">No access records.</div>') +
+      rawBlock(access) +
+    '</section>' +
+    section('Pending counts') + rawBlock(pending) + '</section>';
+};
+
+async function loadHierarchy(merchantId) {
+  const out = $('mhOut');
+  out.innerHTML = '<div class="empty">Loading hierarchy…</div>';
+  try {
+    const [tree, access] = await Promise.all([
+      api('/merchants/hierarchy?merchantId=' + encodeURIComponent(merchantId)),
+      api('/merchants/access-list', { body: { merchantId: merchantId, pageNumber: 1, pageSize: 10 } }).catch(() => null),
+    ]);
+
+    const data = tree.data || {};
+    const subs = data.subMerchants || [];
+    out.innerHTML =
+      '<h2>Hierarchy <span class="sub">merchant ' + esc(data.merchantId || merchantId) + '</span></h2>' +
+      '<div class="pad">' +
+        subs.map((sub) => '<div style="border:1px solid var(--line);border-radius:var(--r-md);padding:10px;margin-bottom:9px">' +
+          '<div><b>' + esc(sub.name) + '</b> <span class="tag">sub ' + esc(sub.id) + '</span>' +
+            (sub.isDefault ? ' <span class="pill ok">default</span>' : '') + '</div>' +
+          '<div class="muted" style="font-size:12px;margin:4px 0 8px">' + esc(sub.location || 'NA') + ' · ' + esc(sub.address || 'NA') + '</div>' +
+          '<div class="scroll"><table><thead><tr><th>Terminal</th><th>Id</th><th>PAN</th><th>Status</th></tr></thead><tbody>' +
+            (sub.terminals || []).map((terminal) => '<tr><td>' + esc(terminal.name) + '</td><td class="num">' + esc(terminal.id) +
+              '</td><td>' + esc(terminal.fonepayPan) + '</td><td>' + statusPill(terminal.status) + '</td></tr>').join('') +
+          '</tbody></table></div>' +
+        '</div>').join('') +
+      '</div>' +
+      (access ? '<h2>Access list</h2>' + rawBlock(access)
+        : '') +
+      rawBlock(tree);
+  } catch (error) {
+    out.innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+  }
+}
+
+/* --- users --- */
+VIEWS.users = async (root) => {
+  const [profile, users, pending] = await Promise.all([
+    api('/profile').catch((error) => ({ error })),
+    api('/users').catch((error) => ({ error })),
+    api('/transactions/pending').catch((error) => ({ error })),
+  ]);
+
+  const profileData = profile.data || profile;
+  const userRows = Array.isArray(users.data) ? users.data : [];
+  const pendingRows = (pending.data && pending.data.transactionList) || (pending.data && pending.data.content) || [];
+
+  root.innerHTML =
+    '<div class="grid c2">' +
+      '<section class="card"><h2>Signed-in profile</h2><div class="pad">' +
+        '<dl class="kv">' +
+          '<dt>Name</dt><dd>' + esc(profileData.fullName || '—') + '</dd>' +
+          '<dt>Email</dt><dd>' + esc(profileData.email || '—') + '</dd>' +
+          '<dt>Mobile</dt><dd>' + esc(profileData.mobileNumber || '—') + '</dd>' +
+        '</dl>' + rawBlock(profile) +
+      '</div></section>' +
+      '<section class="card"><h2>Corporate users <span class="sub">' + esc(userRows.length) + '</span></h2>' +
+        (userRows.length
+          ? '<div class="scroll"><table><thead><tr><th>Id</th><th>Name</th><th>Email</th><th>Enabled</th></tr></thead><tbody>' +
+            userRows.map((user) => '<tr><td class="num">' + esc(user.id) + '</td><td>' + esc(user.fullName) + '</td><td>' +
+              esc(user.emailId) + '</td><td>' + statusPill(user.enabled ? 'active' : 'disabled') + '</td></tr>').join('') +
+            '</tbody></table></div>'
+          : '<div class="empty">No users returned.</div>') +
+        rawBlock(users) +
+      '</section>' +
+    '</div>' +
+    section('Transactions awaiting approval') +
+      (pendingRows.length ? transactionsTable(pendingRows) : '<div class="empty">Nothing pending.</div>') +
+      rawBlock(pending) +
+    '</section>';
+};
+
+/* --- api & session --- */
+VIEWS.api = async (root) => {
+  const [discovery, health, me] = await Promise.all([
+    api('/', { allow401: true }).catch(() => null),
+    fetch('/api/health').then((r) => r.json()).catch(() => null),
+    api('/auth/me').catch((error) => ({ error: error.message })),
+  ]);
+
+  const endpoints = (discovery && discovery.data && discovery.data.endpoints) || [];
+
+  root.innerHTML =
+    '<div class="grid c2">' +
+      '<section class="card"><h2>Session</h2><div class="pad">' +
+        '<dl class="kv">' +
+          '<dt>User</dt><dd>' + esc((me.data && me.data.username) || '—') + '</dd>' +
+          '<dt>Corporate</dt><dd>' + esc((me.data && me.data.corporateCode) || '—') + '</dd>' +
+          '<dt>User id</dt><dd>' + esc((me.data && me.data.userId) || '—') + '</dd>' +
+          '<dt>Expires</dt><dd>' + esc(me.data && me.data.expiresAt ? new Date(me.data.expiresAt).toLocaleString() : '—') + '</dd>' +
+          '<dt>Signed in</dt><dd>' + esc(me.data && me.data.signedInAt ? new Date(me.data.signedInAt).toLocaleString() : '—') + '</dd>' +
+          '<dt>Renewed</dt><dd>' + esc(me.data && me.data.renewedAt ? new Date(me.data.renewedAt).toLocaleString() : 'never') + '</dd>' +
+        '</dl>' +
+        '<div class="row" style="margin-top:12px">' +
+          '<div class="tight"><button class="primary" onclick="forceRenew()">Force renewal</button></div>' +
+          '<div class="tight"><button onclick="copyText(S.token)">Copy session token</button></div>' +
+        '</div>' +
+        '<div class="muted" style="font-size:12px;margin-top:10px">Renewal re-signs in with the credentials kept inside the sealed ' +
+          'session, because Fonepay exposes no refresh endpoint.</div>' +
+        rawBlock(me) +
+      '</div></section>' +
+      '<section class="card"><h2>Worker</h2><div class="pad">' +
+        '<dl class="kv">' +
+          '<dt>Provider</dt><dd>' + esc(health && health.data ? health.data.provider : '—') + '</dd>' +
+          '<dt>API base</dt><dd>' + esc(health && health.data ? health.data.api : '—') + '</dd>' +
+          '<dt>Auth base</dt><dd>' + esc(health && health.data ? health.data.auth : '—') + '</dd>' +
+          '<dt>Origin sent</dt><dd>' + esc(health && health.data ? health.data.origin : '—') + '</dd>' +
+          '<dt>Client code</dt><dd>' + esc(health && health.data ? health.data.clientCode : '—') + '</dd>' +
+          '<dt>Auto-renew</dt><dd>' + esc(health && health.data ? String(health.data.autoRenew) : '—') + '</dd>' +
+          '<dt>Calls made</dt><dd>' + esc(S.calls) + '</dd>' +
+        '</dl>' + rawBlock(health) +
+      '</div></section>' +
+    '</div>' +
+    section('Routes', endpoints.length + ' curated endpoints') +
+      '<div class="scroll"><table><thead><tr><th>Bridge route</th><th>Upstream</th><th>Purpose</th></tr></thead><tbody>' +
+        endpoints.map((endpoint) => '<tr><td class="tag">' + esc(endpoint.route) + '</td><td class="muted">' + esc(endpoint.upstream) +
+          '</td><td class="muted">' + esc(endpoint.title) + '</td></tr>').join('') +
+      '</tbody></table></div>' +
+      rawBlock(discovery) +
+    '</section>';
+};
+
+async function forceRenew() {
+  try {
+    const result = await api('/auth/refresh', { body: {} });
+    S.token = result.data.session;
+    sessionStorage.setItem('fp_session', S.token);
+    toast('Renewed by signing in again.');
+    reload();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+/* ------------------------- boot ------------------------- */
+
+window.addEventListener('hashchange', () => {
+  const next = (location.hash || '').replace('#', '') || 'overview';
+  if (next !== S.route) { S.route = next; render(); }
+});
+
+if (S.token) {
+  // Verify the stored session before showing a dashboard made of errors.
+  api('/auth/me').then((result) => {
+    S.user = Object.assign({}, S.user, result.data);
+    sessionStorage.setItem('fp_user', JSON.stringify(S.user));
+    render();
+  }).catch(() => renderGate('The stored session is no longer valid. Sign in again.'));
+} else {
+  renderGate();
+}
+</script>
+</body>
+</html>

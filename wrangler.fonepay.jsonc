@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fonepay-bridge",
+  "main": "src/fonepay/index.ts",
+  "compatibility_date": "2026-09-21",
+  "assets": {
+    "directory": "./public-fonepay"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "FONEPAY_API_BASE_URL": "https://corporate-kong.fonepay.com/corporate/api",
+    "FONEPAY_AUTH_BASE_URL": "https://corporate-kong.fonepay.com/corporate/auth",
+    "FONEPAY_ORIGIN": "https://fonebiz.fonepay.com",
+    "FONEPAY_CLIENT_CODE": "CORPORATE_USER",
+    "FONEPAY_RENEW_ON_EXPIRY": "1",
+    "ALLOWED_ORIGINS": "",
+    "LOGIN_RATE_LIMIT_PER_MINUTE": "10",
+    "DEBUG_UPSTREAM": "0"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+dist/
+# Local Worker secrets — one per bridge (.dev.vars, .dev.vars.fonepay, …).
+.dev.vars
+.dev.vars.*
+
+# Local scratch: probe scripts and throwaway tokens. Never commit.
+.scratch/
+*.har
+worker-configuration.d.ts

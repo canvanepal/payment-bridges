@@ -1,0 +1,1723 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Merchant console · NepalPay bridge</title>
+<meta name="description" content="Settlements, transactions, refunds and QR codes for a NepalPay merchant, through a Cloudflare Worker bridge." />
+<meta name="theme-color" content="#0c1013" />
+<meta name="color-scheme" content="dark" />
+<meta name="robots" content="noindex" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" />
+<style>
+  :root {
+    /* Charcoal neutrals, all tinted the same cool hue so nothing fights. */
+    --bg: #0c1013;
+    --panel: #12181d;
+    --panel-2: #0f1418;
+    --raise: #161e24;
+    --line: #1c242a;
+    --line-2: #2a353d;
+    --text: #e4eaee;
+    --muted: #8b9aa4;
+    --faint: #5d6b75;
+
+    /* One desaturated accent. The only other hue is money. */
+    --accent: #2f9e88;
+    --accent-dim: #16332d;
+    --accent-line: #2b6d5e;
+    --npr: #7fd7b6;
+
+    --ok: #3fae7c;
+    --warn: #d3a154;
+    --bad: #d0615a;
+
+    /* Shadows carry the background hue instead of pure black. */
+    --shadow-sm: 0 1px 2px rgba(4, 12, 16, .55);
+    --shadow-md: 0 10px 26px -14px rgba(3, 10, 14, .75);
+    --shadow-lg: 0 28px 64px -28px rgba(3, 10, 14, .85);
+    --ring: 0 0 0 3px rgba(47, 158, 136, .28);
+
+    /* Radii tighten as you go deeper into the interface. */
+    --r-lg: 14px;
+    --r-md: 10px;
+    --r-sm: 7px;
+
+    --z-sticky: 5;
+    --z-toast: 20;
+    --z-overlay: 50;
+
+    --sans: 'Geist', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13.5px/1.5 var(--sans);
+  }
+  code, pre, textarea, input, select, .num { font-family: var(--mono); font-size: 12.5px; }
+  a { color: var(--accent); }
+
+  /* ---------- shell ---------- */
+  .shell { display: grid; grid-template-columns: 246px 1fr; min-height: 100vh; }
+  .sidebar {
+    background: linear-gradient(180deg, #101826, #0a0e14);
+    border-right: 1px solid var(--line);
+    padding: 14px 12px; display: flex; flex-direction: column; gap: 12px;
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+  .brand { display: flex; align-items: center; gap: 9px; padding: 2px 6px 10px; }
+  .brand .mark {
+    width: 28px; height: 28px; border-radius: 8px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #7c3aed);
+    display: grid; place-items: center; font-weight: 700; font-size: 13px; color: #fff;
+  }
+  .brand b { font-size: 13px; display: block; line-height: 1.2; }
+  .brand span { color: var(--muted); font-size: 11px; }
+  nav { display: flex; flex-direction: column; gap: 2px; }
+  nav button {
+    all: unset; cursor: pointer; display: flex; align-items: center; gap: 9px;
+    padding: 7px 10px; border-radius: 7px; color: var(--muted); font-size: 13px;
+  }
+  nav button:hover { background: var(--raise); color: var(--text); }
+  nav button.active { background: var(--accent-dim); color: #fff; }
+  nav button .ic { width: 15px; text-align: center; opacity: .9; }
+  nav .group { padding: 12px 10px 5px; font-size: 10.5px; letter-spacing: .9px; text-transform: uppercase; color: #566274; }
+
+  .side-card {
+    margin-top: auto; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--panel-2); padding: 10px; font-size: 12px;
+  }
+  .side-card .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+  .side-card .row span { color: var(--muted); }
+  .side-card .row b { font-weight: 500; font-family: var(--mono); font-size: 11.5px; }
+
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  header.top {
+    position: sticky; top: 0; z-index: 4;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 11px 18px; border-bottom: 1px solid var(--line);
+    background: rgba(11,15,20,.86); backdrop-filter: blur(8px);
+  }
+  header.top h1 { font-size: 14.5px; margin: 0; font-weight: 600; }
+  header.top .sub { color: var(--muted); font-size: 12px; }
+  header.top .sep { flex: 1; }
+  .content { padding: 16px 18px 40px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+  /* ---------- atoms ---------- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
+    border-radius: 999px; font-size: 11.5px; border: 1px solid var(--line-2);
+    background: var(--panel-2); color: var(--muted); white-space: nowrap;
+  }
+  .pill b { color: var(--text); font-weight: 600; }
+  .pill.ok { border-color: #1f4d38; } .pill.ok .dot { background: var(--ok); }
+  .pill.warn { border-color: #4d3f1f; } .pill.warn .dot { background: var(--warn); }
+  .pill.bad { border-color: #4d2220; } .pill.bad .dot { background: var(--bad); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+
+  button {
+    font: inherit; font-size: 12.5px; font-weight: 600; padding: 7px 12px;
+    border-radius: 7px; cursor: pointer; border: 1px solid var(--line-2);
+    background: #182233; color: var(--text);
+  }
+  button:hover { border-color: #3a4a61; background: #1d2839; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #2f74e0; }
+  button.ghost { background: transparent; }
+  button.tiny { padding: 3px 8px; font-size: 11.5px; font-weight: 500; }
+  .btnrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .card > h2 {
+    margin: 0; padding: 9px 13px; font-size: 11.5px; font-weight: 600; letter-spacing: .7px;
+    text-transform: uppercase; color: var(--muted); background: var(--panel-2);
+    border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 9px;
+  }
+  .card > h2 .sep { flex: 1; }
+  .card .pad { padding: 13px; }
+  .card .pad + .pad { border-top: 1px solid var(--line); }
+
+  .grid { display: grid; gap: 14px; }
+  .cols-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .cols-3 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .cols-4 { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+
+  .stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 13px; }
+  .stat .k { color: var(--muted); font-size: 11.5px; letter-spacing: .4px; text-transform: uppercase; }
+  .stat .v { font-size: 24px; font-weight: 650; margin-top: 5px; letter-spacing: -.3px; }
+  .stat .v.small { font-size: 15px; font-family: var(--mono); font-weight: 500; }
+  .stat .f { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .stat.hl { border-color: #1f4d38; background: linear-gradient(180deg, #0e1a15, #0d1620); }
+  .stat.hl .v { color: var(--npr); }
+  .stat.warnish { border-color: #4d3f1f; }
+  .stat.warnish .v { color: var(--warn); }
+
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .field > label { font-size: 11px; color: var(--muted); letter-spacing: .3px; text-transform: uppercase; }
+  input[type=text], input[type=password], input[type=number], input[type=date], select, textarea {
+    width: 100%; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line-2);
+    background: #090d13; color: var(--text); outline: none;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 130px; line-height: 1.5; tab-size: 2; }
+  .filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 11px; align-items: end; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th {
+    color: var(--muted); font-weight: 500; font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: .5px; background: var(--panel-2); position: sticky; top: 0;
+  }
+  tbody tr:hover { background: var(--raise); }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  td.amt { color: var(--npr); font-family: var(--mono); text-align: right; }
+  .scroll { overflow: auto; max-height: 62vh; }
+  tbody tr.clickable { cursor: pointer; }
+
+  pre.json {
+    margin: 0; padding: 12px; background: #090d13; border-top: 1px solid var(--line);
+    max-height: 44vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  details.raw summary {
+    cursor: pointer; padding: 8px 13px; font-size: 11.5px; color: var(--muted);
+    border-top: 1px solid var(--line); list-style: none; user-select: none;
+  }
+  details.raw summary::-webkit-details-marker { display: none; }
+  details.raw summary:hover { color: var(--text); }
+  details.raw[open] summary { border-bottom: 1px solid var(--line); }
+
+  .bar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding: 9px 13px; border-bottom: 1px solid var(--line); }
+  .code { font-family: var(--mono); font-weight: 600; }
+  .note { padding: 10px 12px; border-radius: 8px; font-size: 12.5px; border: 1px solid var(--line-2); background: var(--panel-2); color: var(--muted); }
+  .note b { color: var(--text); }
+  .note.ok { border-color: #1f4d38; background: #0d1a14; color: #a9dfc3; }
+  .note.warn { border-color: #4d3f1f; background: #1a1509; color: #e6cf9d; }
+  .note.bad { border-color: #4d2220; background: #1a0f0f; color: #e8b3b0; }
+  .muted { color: var(--muted); }
+  .empty { padding: 20px 13px; text-align: center; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; padding: 13px; }
+  .qrbox { padding: 14px; text-align: center; }
+  .qrbox img { background: #fff; padding: 10px; border-radius: 9px; width: 100%; max-width: 260px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 12.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--line-2); border-top-color: var(--accent); border-radius: 50%; animation: sp .7s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .ep { border-bottom: 1px solid var(--line); padding: 11px 13px; }
+  .ep:last-child { border-bottom: 0; }
+  .ep .hdr { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .ep .m { font-family: var(--mono); font-size: 12px; }
+  .ep .u { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+
+  /* ---------- login ---------- */
+  .login {
+    position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+    background: radial-gradient(1000px 600px at 20% -10%, #16233a, #0b0f14 60%);
+  }
+  .login .box { width: min(400px, 92vw); background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .login h2 { margin: 0 0 4px; font-size: 17px; }
+  .login p { margin: 0 0 16px; color: var(--muted); font-size: 12.5px; }
+  .hidden { display: none !important; }
+
+  /* ================================================================== */
+  /* v2 visual layer — typography, surfaces, states.                    */
+  /* Overrides the structural layer above; class names are unchanged so  */
+  /* the console's wiring keeps working.                                */
+  /* ================================================================== */
+
+  body {
+    font: 14px/1.55 var(--sans);
+    letter-spacing: -0.006em;
+    -webkit-font-smoothing: antialiased;
+    background: var(--bg);
+  }
+
+  /* Ambient wash + grain: flat charcoal reads as unfinished. */
+  body::before {
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(900px 520px at 12% -8%, rgba(47, 158, 136, .10), transparent 62%),
+      radial-gradient(760px 480px at 96% 4%, rgba(90, 130, 160, .07), transparent 60%);
+  }
+  body::after {
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0; opacity: .035;
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="140" height="140"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="3"/></filter><rect width="140" height="140" filter="url(%23n)"/></svg>');
+  }
+  .shell, .login { position: relative; z-index: 1; }
+
+  /* ---------- type scale ---------- */
+  h1, h2, .stat .v { text-wrap: balance; }
+  header.top h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.022em; }
+  header.top .sub { font-size: 12.5px; color: var(--faint); letter-spacing: -0.004em; }
+  .card > h2 {
+    font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--faint);
+  }
+  .stat .k, .field > label { letter-spacing: .09em; color: var(--faint); font-size: 10.5px; }
+  .stat .v { font-size: 27px; font-weight: 600; letter-spacing: -0.03em; }
+  .stat .v.small { font-size: 15px; letter-spacing: -0.01em; }
+  .stat .f { color: var(--faint); font-size: 11.5px; }
+  .muted { color: var(--muted); }
+
+  /* Data is monospaced and tabular everywhere it matters. */
+  .num, .amt, .stat .v, .kv dd, .code, pre.json, th.num, td.num { font-variant-numeric: tabular-nums; }
+  .stat .v { font-family: var(--sans); }
+  td.amt { font-family: var(--mono); font-weight: 500; }
+  .kv dd { font-family: var(--mono); font-size: 12px; }
+
+  a { color: var(--npr); text-underline-offset: 3px; }
+
+  /* ---------- shell ---------- */
+  .shell { grid-template-columns: 236px 1fr; }
+  .sidebar {
+    padding: 18px 14px; gap: 16px;
+    background: linear-gradient(180deg, rgba(20, 28, 33, .92), rgba(10, 14, 17, .92));
+    backdrop-filter: blur(6px);
+  }
+  .brand { padding: 0 6px 8px; gap: 11px; }
+  .brand .mark {
+    width: 30px; height: 30px; border-radius: 9px; font-size: 12px; letter-spacing: -0.02em;
+    background: var(--accent-dim); color: var(--npr);
+    border: 1px solid var(--accent-line);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), var(--shadow-sm);
+  }
+  .brand b { font-size: 13px; letter-spacing: -0.015em; }
+  .brand span { font-size: 10.5px; color: var(--faint); letter-spacing: .02em; }
+
+  nav { gap: 1px; }
+  nav .group {
+    padding: 16px 10px 6px; font-size: 10px; letter-spacing: .12em; color: var(--faint);
+  }
+  nav button {
+    position: relative; padding: 7px 11px; border-radius: var(--r-sm);
+    font-size: 13px; letter-spacing: -0.008em;
+    transition: background 200ms cubic-bezier(.2, .6, .3, 1), color 200ms;
+  }
+  nav button .ic { width: 16px; opacity: .7; font-size: 12.5px; }
+  nav button.active { background: var(--accent-dim); color: #dff3ec; }
+  nav button.active .ic { opacity: 1; color: var(--npr); }
+  nav button.active::before {
+    content: ''; position: absolute; left: -14px; top: 7px; bottom: 7px;
+    width: 2px; border-radius: 0 2px 2px 0; background: var(--accent);
+  }
+  nav button:active { transform: translateY(1px); }
+  nav button:focus-visible, button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, tbody tr:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+
+  .side-card {
+    border-radius: var(--r-md); background: rgba(15, 20, 24, .9);
+    padding: 11px 12px; font-size: 12px; box-shadow: var(--shadow-sm);
+  }
+  .side-card .row b { font-size: 11px; letter-spacing: -0.01em; color: var(--text); }
+
+  header.top {
+    padding: 12px 22px; gap: 12px;
+    background: rgba(12, 16, 19, .82); backdrop-filter: blur(10px) saturate(1.1);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03);
+  }
+  header.top h1 { margin-bottom: 1px; }
+  .content { padding: 20px 22px 56px; gap: 16px; max-width: 1440px; width: 100%; }
+
+  /* ---------- surfaces ---------- */
+  .card {
+    border-radius: var(--r-lg); border-color: var(--line);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025), var(--shadow-md);
+  }
+  .card > h2 { padding: 10px 14px; background: linear-gradient(180deg, rgba(22, 30, 36, .7), rgba(15, 20, 24, .55)); }
+  .card .pad { padding: 15px 14px; }
+  .card .bar { padding: 10px 14px; }
+
+  .stat {
+    border-radius: var(--r-md); background: rgba(15, 20, 24, .72);
+    padding: 15px 15px 16px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03);
+    transition: border-color 200ms, transform 200ms;
+  }
+  .stat:hover { border-color: var(--line-2); }
+  .stat.hl { border-color: var(--accent-line); background: linear-gradient(180deg, rgba(22, 51, 45, .55), rgba(15, 20, 24, .72)); }
+  .stat.hl .v { color: var(--npr); }
+  .stat.warnish .v { color: var(--warn); }
+
+  .pill {
+    padding: 3px 9px 3px 8px; font-size: 11px; letter-spacing: -0.002em;
+    background: rgba(15, 20, 24, .85); border-color: var(--line);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03);
+  }
+  .pill .dot { width: 6px; height: 6px; }
+  .pill.ok { border-color: #23583f; } .pill.warn { border-color: #56411f; } .pill.bad { border-color: #542a27; }
+
+  /* ---------- controls ---------- */
+  button {
+    height: 32px; padding: 0 13px; border-radius: 8px; font-size: 12.5px; font-weight: 500;
+    letter-spacing: -0.005em;
+    background: linear-gradient(180deg, rgba(32, 42, 49, .9), rgba(22, 30, 36, .9));
+    border-color: var(--line-2);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05), var(--shadow-sm);
+    transition: background 180ms, border-color 180ms, transform 120ms, color 180ms;
+  }
+  button:hover { border-color: #3b4a55; background: linear-gradient(180deg, #26323a, #1c262d); }
+  button:active { transform: translateY(1px); }
+  button.primary {
+    background: linear-gradient(180deg, #34a68f, #2a8d79); border-color: #3aab93; color: #f2fffb;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), 0 8px 20px -12px rgba(47, 158, 136, .9);
+  }
+  button.primary:hover { background: linear-gradient(180deg, #3bb298, #2e9a83); }
+  button.ghost {
+    background: transparent; box-shadow: none; border-color: transparent; color: var(--muted);
+  }
+  button.ghost:hover { background: rgba(255, 255, 255, .04); border-color: var(--line); color: var(--text); }
+  button.tiny { height: 26px; padding: 0 10px; font-size: 11.5px; border-radius: var(--r-sm); }
+  button:disabled { opacity: .45; }
+
+  input[type=text], input[type=password], input[type=number], input[type=date], select, textarea {
+    height: 32px; padding: 0 10px; border-radius: 8px; border-color: var(--line-2);
+    background: rgba(8, 11, 13, .85); font-size: 12.5px;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .35);
+    transition: border-color 180ms, box-shadow 180ms;
+  }
+  textarea { height: auto; padding: 9px 10px; }
+  select { cursor: pointer; }
+  input:hover, select:hover, textarea:hover { border-color: #3b4a55; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: var(--ring); }
+  .field > label { margin-bottom: 1px; }
+  .filters { gap: 12px; }
+
+  /* ---------- tables ---------- */
+  .scroll { max-height: 64vh; }
+  table { font-size: 12.5px; }
+  th {
+    padding: 8px 12px; background: rgba(15, 20, 24, .95); backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line-2); font-size: 10px; letter-spacing: .1em;
+  }
+  td { padding: 9px 12px; border-bottom: 1px solid rgba(28, 36, 42, .7); }
+  th:first-child, td:first-child { padding-left: 14px; }
+  th:last-child, td:last-child { padding-right: 14px; }
+  tbody tr { transition: background 140ms; }
+  tbody tr:hover { background: rgba(47, 158, 136, .045); }
+  tbody tr.clickable:hover { background: rgba(47, 158, 136, .09); }
+  td:first-child { color: var(--text); font-weight: 500; }
+
+  .ep { padding: 13px 14px; transition: background 160ms; }
+  .ep:hover { background: rgba(255, 255, 255, .012); }
+  .ep .m { font-size: 12.5px; color: var(--text); }
+  .ep .u { font-size: 10.5px; color: var(--faint); }
+
+  /* ---------- states ---------- */
+  .note { border-radius: var(--r-md); background: rgba(15, 20, 24, .85); font-size: 12.5px; line-height: 1.55; }
+  .note b { font-weight: 600; }
+  .note.ok { border-color: var(--accent-line); background: rgba(22, 51, 45, .45); color: #b6e3d3; }
+  .note.warn { border-color: #56411f; background: rgba(60, 44, 19, .45); color: #e8cf9f; }
+  .note.bad { border-color: #542a27; background: rgba(56, 24, 22, .45); color: #ecc0bb; }
+  .note button { margin-top: 9px; }
+
+  .empty {
+    padding: 34px 16px; color: var(--faint); font-size: 12.5px;
+    display: flex; flex-direction: column; align-items: center; gap: 7px; text-align: center;
+  }
+  .empty::before {
+    content: ''; width: 30px; height: 30px; border-radius: var(--r-sm);
+    border: 1px dashed var(--line-2); background: rgba(15, 20, 24, .6);
+  }
+  .empty a { color: var(--npr); }
+
+  .sk { position: relative; overflow: hidden; border-radius: 6px; background: rgba(255, 255, 255, .045); }
+  .sk::after {
+    content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .07), transparent);
+    animation: shimmer 1.5s infinite;
+  }
+  @keyframes shimmer { to { transform: translateX(100%); } }
+  .skeleton { padding: 15px 14px; display: flex; flex-direction: column; gap: 9px; }
+  .skeleton .row { display: flex; gap: 10px; }
+  .skeleton .row > * { height: 12px; flex: 1; }
+  .skeleton .row.wide > *:first-child { flex: 2; }
+
+  .spin { width: 12px; height: 12px; border-width: 2px; border-color: var(--line-2); border-top-color: var(--accent); }
+
+  .raw summary { font-size: 11.5px; letter-spacing: .02em; }
+  details.raw summary:hover { background: rgba(255, 255, 255, .015); }
+  pre.json { font-size: 12px; line-height: 1.6; color: #c3d0d8; }
+
+  .qrbox { padding: 18px; }
+  .qrbox img {
+    border-radius: var(--r-md); padding: 12px; max-width: 272px;
+    box-shadow: 0 18px 40px -22px rgba(0, 0, 0, .9), inset 0 0 0 1px rgba(0, 0, 0, .04);
+  }
+  .chips { padding: 14px; gap: 8px; }
+  .kv { gap: 5px 16px; }
+
+  /* ---------- login ---------- */
+  .login { background: radial-gradient(1100px 640px at 18% -12%, rgba(47, 158, 136, .16), transparent 60%), var(--bg); }
+  .login .box {
+    border-radius: 18px; padding: 24px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05), var(--shadow-lg);
+    animation: rise 420ms cubic-bezier(.2, .7, .3, 1) both;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+  .login h2 { font-size: 19px; letter-spacing: -0.025em; margin: 0 0 5px; }
+  .login p { line-height: 1.6; max-width: 46ch; text-wrap: pretty; }
+  .login .mark { width: 34px; height: 34px; border-radius: 10px; }
+  .login .brand b { font-size: 13.5px; }
+  .login .field { margin-bottom: 13px; }
+
+  #toast { animation: rise 260ms cubic-bezier(.2, .7, .3, 1) both; z-index: var(--z-toast); }
+
+  /* ---------- scrollbars, motion, print ---------- */
+  * { scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: #3b4a55; background-clip: content-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
+
+  .skip {
+    position: absolute; left: 12px; top: -48px; z-index: var(--z-overlay);
+    padding: 9px 14px; border-radius: var(--r-sm); background: var(--panel);
+    border: 1px solid var(--accent-line); color: var(--text); font-size: 12.5px; text-decoration: none;
+    transition: top 160ms;
+  }
+  .skip:focus, .skip:focus-visible { top: 12px; }
+  .brand-flush { padding: 0 0 14px; }
+  .login .brand span { color: var(--muted); }
+
+  /* Keyboard users need to see where a clickable row or header went. */
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover td:first-child { color: var(--npr); }
+  .card > h2 .sep { min-width: 0; }
+
+  .snip { position: relative; margin-bottom: 14px; }
+  .snip .t { font-size: 11.5px; color: var(--faint); margin-bottom: 6px; letter-spacing: .02em; }
+  .snip pre { border: 1px solid var(--line); border-radius: var(--r-md); max-height: 230px; }
+  .snip > button { position: absolute; top: 18px; right: 8px; }
+  .snip + .snip { margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<div class="login" id="login">
+  <form class="box" id="loginForm">
+    <div class="brand brand-flush">
+      <div class="mark">NP</div>
+      <div><b>NepalPay bridge</b><span>Merchant console</span></div>
+    </div>
+    <h2>Sign in to NepalPay</h2>
+    <p>Credentials go to this Worker only. It signs in upstream and hands back an opaque
+       session token, so NepalPay's real tokens never reach this browser.</p>
+    <div class="field" style="margin-bottom:11px">
+      <label for="u">Username</label>
+      <input id="u" type="text" autocomplete="username" placeholder="merchant username" />
+    </div>
+    <div class="field" style="margin-bottom:14px">
+      <label for="p">Password</label>
+      <input id="p" type="password" autocomplete="current-password" placeholder="••••••••" />
+    </div>
+    <div class="btnrow">
+      <button class="primary" type="submit" id="loginBtn">Sign in</button>
+      <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+        <input type="checkbox" id="remember" style="width:auto" /> remember this browser
+      </label>
+    </div>
+    <div id="loginMsg" class="note bad hidden" style="margin-top:14px"></div>
+  </form>
+</div>
+
+<a class="skip" href="#view">Skip to content</a>
+
+<div class="shell hidden" id="shell">
+  <aside class="sidebar" aria-label="Primary">
+    <div class="brand">
+      <div class="mark">NP</div>
+      <div><b id="brandName">NepalPay</b><span id="brandCode">bridge console</span></div>
+    </div>
+    <nav id="nav" aria-label="Console sections"></nav>
+    <div class="side-card">
+      <div class="row"><span>user</span><b id="sideUser">—</b></div>
+      <div class="row"><span>roles</span><b id="sideRoles">—</b></div>
+      <div class="row"><span>token</span><b id="sideExpiry">—</b></div>
+      <div class="row"><span>renewal</span><b id="sideRenew">—</b></div>
+      <div class="btnrow" style="margin-top:9px">
+        <button class="tiny" onclick="doRefresh()">Renew</button>
+        <button class="tiny ghost" onclick="doLogout()">Sign out</button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="top">
+      <div>
+        <h1 id="viewTitle">Dashboard</h1>
+        <div class="sub" id="viewSub"></div>
+      </div>
+      <span class="sep"></span>
+      <span class="pill" id="hUpstream"><span class="dot"></span>upstream …</span>
+      <span class="pill" id="hMode"><span class="dot"></span>headers …</span>
+      <span class="pill" id="hSession"><span class="dot"></span>session</span>
+    </header>
+    <main class="content" id="view" tabindex="-1"></main>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* ==================================================================== */
+/* state                                                                */
+/* ==================================================================== */
+
+const SKEY = 'npb.session';
+const state = {
+  session: '',
+  identity: null,
+  view: 'dashboard',
+  health: null,
+  cache: { stores: [], terminals: {}, networks: [], reasons: [], roles: [], banks: [], qrIds: new Set() },
+  history: [],
+  retry: new Map(),
+};
+let retryKey = 0;
+const $ = (id) => document.getElementById(id);
+
+/**
+ * Local calendar date, not the UTC one. Using toISOString() here shifted the
+ * default end date back a day for any user east of UTC, which hid today's
+ * transactions — NepalPay's own dates are local (NPT).
+ */
+const isoDate = (date) =>
+  date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+const today = () => isoDate(new Date());
+const daysAgo = (n) => isoDate(new Date(Date.now() - n * 864e5));
+
+/* ==================================================================== */
+/* fetch layer                                                          */
+/* ==================================================================== */
+
+async function api(path, { method = 'POST', body, auth = true } = {}) {
+  const init = { method, headers: {} };
+  if (auth && state.session) init.headers.Authorization = 'Bearer ' + state.session;
+  if (body !== undefined && method !== 'GET') {
+    init.headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(body);
+  }
+
+  const started = performance.now();
+  let res, text;
+  try {
+    res = await fetch(path, init);
+    text = await res.text();
+  } catch (err) {
+    return failed(path, method, started, 'NETWORK_ERROR', String(err && err.message || err));
+  }
+
+  // Sliding renewal: a fresh sealed session rides back on this header.
+  const rotated = res.headers.get('X-Session-Token');
+  if (rotated) setSession(rotated, true);
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (_) {
+    json = { code: 'NON_JSON', status: 'FAILED', message: 'Upstream response was not JSON.', data: text, errors: [] };
+  }
+
+  const result = {
+    path, method, status: res.status, ms: Math.round(performance.now() - started),
+    bytes: text.length, json, renewed: Boolean(rotated),
+  };
+  state.history.unshift(result);
+  if (state.history.length > 40) state.history.pop();
+  return result;
+}
+
+function failed(path, method, started, code, message) {
+  return {
+    path, method, status: 0, ms: Math.round(performance.now() - started), bytes: 0, renewed: false,
+    json: { code, status: 'FAILED', message, data: null, errors: [] },
+  };
+}
+
+/** Unwrap envelopes nested inside `data` — one upstream route double-wraps. */
+function payload(result) {
+  const json = result.json;
+  if (!json) return null;
+  const data = json.data === undefined ? json : json.data;
+  if (data && typeof data === 'object' && !Array.isArray(data) && 'code' in data && 'status' in data) {
+    return data.data;
+  }
+  return data;
+}
+
+const EXPLAIN = {
+  UPSTREAM_BLOCKED: 'The NepalPay edge refused this before the API saw it, so credentials were never evaluated. Check NEPALPAY_HEADER_MODE (default "minimal").',
+  AUTH_FAILED: 'NepalPay rejected the credentials.',
+  SESSION_EXPIRED: 'The upstream token expired and could not be renewed. Sign in again.',
+  INVALID_SESSION: 'This session token is invalid. Sign in again.',
+  NO_SESSION: 'No session token sent.',
+  RATE_LIMITED: 'Too many sign-in attempts in the last minute. Wait a moment.',
+  NOT_CONFIGURED: 'SESSION_SECRET is not set on the Worker.',
+  UPSTREAM_UNREACHABLE: 'The Worker could not open a connection to NepalPay.',
+  REFRESH_NOT_CONFIGURED: 'Renewal is off — set NEPALPAY_REFRESH_PATH.',
+  REFRESH_FAILED: 'The refresh token was rejected; sign in again.',
+};
+
+/* ==================================================================== */
+/* session                                                              */
+/* ==================================================================== */
+
+function setSession(token, rotated) {
+  state.session = token || '';
+  try {
+    if (!token) { sessionStorage.removeItem(SKEY); localStorage.removeItem(SKEY); }
+    else if ($('remember')?.checked) localStorage.setItem(SKEY, token);
+    else sessionStorage.setItem(SKEY, token);
+  } catch (_) { /* private mode: keep in memory */ }
+  if (rotated) renderSession();
+}
+
+function restoreSession() {
+  try { return localStorage.getItem(SKEY) || sessionStorage.getItem(SKEY) || ''; } catch (_) { return ''; }
+}
+
+function countdown(at) {
+  const ms = at - Date.now();
+  if (ms <= 0) return 'expired';
+  const m = Math.floor(ms / 60000), s = Math.floor((ms % 60000) / 1000);
+  return m > 0 ? m + 'm ' + s + 's' : s + 's';
+}
+
+async function doLogin(event) {
+  event.preventDefault();
+  const username = $('u').value.trim(), password = $('p').value;
+  const btn = $('loginBtn'), msg = $('loginMsg');
+  if (!username || !password) return showLoginError('Enter a username and password.');
+  btn.disabled = true; btn.textContent = 'Signing in…'; msg.classList.add('hidden');
+
+  const r = await api('/api/auth/login', { method: 'POST', auth: false, body: { username, password } });
+  btn.disabled = false; btn.textContent = 'Sign in';
+
+  if (r.json.code !== '000') return showLoginError(label(r.json));
+  setSession(r.json.data.session);
+  state.identity = Object.assign({}, r.json.data.user, { expiresAt: r.json.data.expiresAt, autoRenew: r.json.data.autoRenew });
+  $('p').value = '';
+  $('login').classList.add('hidden');
+  $('shell').classList.remove('hidden');
+  renderSession();
+  loadHealth();
+  go('dashboard');
+}
+
+function showLoginError(text) {
+  const msg = $('loginMsg');
+  msg.textContent = text;
+  msg.classList.remove('hidden');
+}
+
+async function doRefresh() {
+  const r = await api('/api/auth/refresh');
+  if (r.json.data?.session) {
+    setSession(r.json.data.session, true);
+    if (state.identity) state.identity.expiresAt = r.json.data.expiresAt;
+    renderSession();
+  }
+  toast(r.json.code === '000' ? 'Session renewed via style "' + r.json.data.style + '".' : label(r.json), r.json.code === '000');
+}
+
+async function doLogout() {
+  await api('/api/auth/logout');
+  setSession('');
+  state.identity = null;
+  state.cache = { stores: [], terminals: {}, networks: [], reasons: [], roles: [], banks: [], qrIds: new Set() };
+  $('shell').classList.add('hidden');
+  $('login').classList.remove('hidden');
+}
+
+function renderSession() {
+  const i = state.identity;
+  $('sideUser').textContent = i?.username ?? '—';
+  $('sideRoles').textContent = i?.roles ?? '—';
+  $('sideExpiry').textContent = i?.expiresAt ? countdown(i.expiresAt) : (state.session ? 'held' : '—');
+  $('sideRenew').textContent = i ? (i.autoRenew ? 'auto' : 'off') : '—';
+  if (i) {
+    $('brandName').textContent = i.merchantLegalName || i.merchantCode || 'NepalPay';
+    $('brandCode').textContent = i.merchantCode || 'merchant';
+  }
+  const ok = Boolean(state.session);
+  $('hSession').className = 'pill' + (ok ? ' ok' : '');
+  $('hSession').innerHTML = '<span class="dot"></span>' + (ok ? 'session active' : 'no session');
+}
+
+function label(json) {
+  const code = json?.code ?? 'ERROR';
+  return code + ' — ' + (json?.message ?? EXPLAIN[code] ?? 'Request failed.');
+}
+
+/* ==================================================================== */
+/* chrome                                                              */
+/* ==================================================================== */
+
+async function loadHealth() {
+  const r = await api('/api/health', { method: 'GET', auth: false });
+  const d = r.json.data;
+  state.health = d || null;
+  if (!d) {
+    $('hUpstream').className = 'pill bad';
+    $('hUpstream').innerHTML = '<span class="dot"></span>Worker unreachable';
+    $('hMode').classList.add('hidden');
+    return;
+  }
+  $('hUpstream').className = 'pill ok';
+  $('hUpstream').innerHTML = '<span class="dot"></span>upstream <b>' + esc(String(d.upstream).replace(/^https?:\/\//, '')) + '</b>';
+  $('hMode').className = 'pill ok';
+  $('hMode').innerHTML = '<span class="dot"></span>headers <b>' + esc(d.headerMode) + '</b>';
+}
+
+let toastTimer;
+function toast(text, good) {
+  const el = $('viewTitle').parentElement;
+  let node = document.getElementById('toast');
+  if (!node) {
+    node = document.createElement('span');
+    node.id = 'toast';
+    node.className = 'pill';
+    el.appendChild(node);
+  }
+  node.className = 'pill ' + (good ? 'ok' : 'bad');
+  node.innerHTML = '<span class="dot"></span>' + esc(text);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.remove(), 6000);
+}
+
+/* ==================================================================== */
+/* renderers                                                            */
+/* ==================================================================== */
+
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function money(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return value == null ? '—' : esc(value);
+  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+const COLUMN_ORDER = [
+  'instructionId', 'nqrTxnId', 'localTransactionDateTime', 'txnDate', 'sessionDate', 'settlementDate',
+  'payerName', 'payerMobileNumber', 'amount', 'refundableAmount', 'totalAmount', 'totalSearchAmount',
+  'totalTxn', 'totalFinalTxn', 'totalCharge', 'settleUnsettleTxnInfo', 'sessionSrlInfo',
+  'storeLabel', 'storeName', 'storeDesc', 'terminal', 'qrType', 'issuerNetwork', 'issuerId', 'acquirerId',
+  'creditStatus', 'sessionStatus', 'refundStatus', 'status', 'settlementStatus', 'sessionSrlNo',
+  'merchantTxnRef', 'validationTraceId', 'narration', 'enabled', 'totalItems', 'mobileNumber', 'name', 'username',
+];
+const SKIP_KEYS = ['addnField4','addnField5','addnField6','addnField7','addnField8','addnField9','addnField10','merchantCode','id'];
+
+function columnsOf(rows) {
+  const seen = [];
+  for (const row of rows) for (const key of Object.keys(row)) if (!seen.includes(key)) seen.push(key);
+  const useful = seen.filter((key) => {
+    if (SKIP_KEYS.includes(key)) return false;
+    return rows.some((row) => row[key] !== null && row[key] !== undefined && row[key] !== '');
+  });
+  useful.sort((a, b) => {
+    const ia = COLUMN_ORDER.indexOf(a), ib = COLUMN_ORDER.indexOf(b);
+    if (ia === -1 && ib === -1) return a.localeCompare(b);
+    if (ia === -1) return 1;
+    if (ib === -1) return -1;
+    return ia - ib;
+  });
+  return useful.slice(0, 12);
+}
+
+function cell(key, value) {
+  if (value == null || value === '') return '<td class="muted">—</td>';
+  if (typeof value === 'boolean') return '<td>' + (value ? 'yes' : 'no') + '</td>';
+  if (typeof value === 'object') return '<td class="muted">' + esc(JSON.stringify(value).slice(0, 60)) + '…</td>';
+  if (/amount/i.test(key) || /Fee$/.test(key)) return '<td class="amt">' + money(value) + '</td>';
+  const text = String(value);
+  return '<td' + (text.length < 40 ? '' : ' title="' + esc(text) + '"') + '>' + esc(text.length > 46 ? text.slice(0, 46) + '…' : text) + '</td>';
+}
+
+function tableHtml(rows, columns) {
+  const cols = columns || columnsOf(rows);
+  const head = cols.map((key) => '<th' + (/amount/i.test(key) ? ' class="num"' : '') + '>' + esc(key) + '</th>').join('');
+  const body = rows.map((row) => '<tr>' + cols.map((key) => cell(key, row[key])).join('') + '</tr>').join('');
+  return '<div class="scroll"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+}
+
+function isDataImage(value) {
+  return typeof value === 'string' && /^data:image\/(png|jpeg);base64,/i.test(value);
+}
+
+/** Render `data` from any endpoint without knowing its exact schema. */
+function renderData(data) {
+  if (data == null) return '<div class="empty">No data returned.</div>';
+  if (isDataImage(data)) return qrHtml(data);
+  if (typeof data === 'string') {
+    if (/^https?:/.test(data)) return '<div class="pad"><a href="' + esc(data) + '" target="_blank" rel="noopener">' + esc(data) + '</a></div>';
+    return '<div class="pad"><code>' + esc(data) + '</code></div>';
+  }
+  if (Array.isArray(data)) {
+    if (!data.length) return '<div class="empty">Empty list.</div>';
+    if (typeof data[0] === 'string') return '<div class="chips">' + data.map((v) => '<span class="pill">' + esc(v) + '</span>').join('') + '</div>';
+    return tableHtml(data);
+  }
+  if (typeof data === 'object') {
+    if (data.qrString || data.webSocketUrl) return qrMetaHtml(data);
+    if (Array.isArray(data.result)) {
+      const rows = data.result;
+      const pager = pagerHtml(data.pageable);
+      return (rows.length ? tableHtml(rows) : '<div class="empty">No rows.</div>') + pager;
+    }
+    if (data.settleUnsettleTxnInfo) return '<div class="pad">' + kvHtml({
+      'settled amount': money(data.settleUnsettleTxnInfo.totalSettleAmount),
+      'settled txns': data.settleUnsettleTxnInfo.totalSettleTxnCount,
+      'unsettled amount': money(data.settleUnsettleTxnInfo.totalUnsettleAmount),
+      'unsettled txns': data.settleUnsettleTxnInfo.totalUnsettleTxnCount,
+      'last session': data.sessionSrlInfo?.sessionSrlNo,
+      'session date': data.sessionSrlInfo?.sessionDate,
+      'session status': data.sessionSrlInfo?.status,
+      'settlement date': data.sessionSrlInfo?.settlementDate,
+      network: data.sessionSrlInfo?.network,
+      currency: data.sessionSrlInfo?.currency,
+    }) + '</div>';
+    if (Array.isArray(data.terminals)) {
+      const stores = data.stores ? Object.keys(data.stores) : [];
+      return '<div class="pad">' + kvHtml({
+        store: stores.join(', ') || '—',
+        terminals: (data.terminals || []).join(', ') || '—',
+        'total amount': data.totalAmount == null ? '—' : money(data.totalAmount),
+        'total txns': data.totalTxn ?? '—',
+      }) + '</div>';
+    }
+    return tableHtml([data]);
+  }
+  return '<div class="pad"><code>' + esc(JSON.stringify(data)) + '</code></div>';
+}
+
+function kvHtml(pairs) {
+  return '<dl class="kv">' + Object.entries(pairs)
+    .map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v == null || v === '' ? '—' : v) + '</dd>').join('') + '</dl>';
+}
+
+function qrHtml(dataUri) {
+  return '<div class="qrbox"><img alt="QR code" src="' + esc(dataUri) + '" />' +
+    '<div class="muted" style="margin-top:8px">' + esc(dataUri.length) + ' chars of base64 PNG</div></div>';
+}
+
+function qrMetaHtml(data) {
+  return qrHtml(data.qrString) +
+    '<div class="pad" style="border-top:1px solid var(--line)">' + kvHtml({
+      'validation trace': data.validationTraceId,
+      terminal: data.merchantId,
+      user: data.username,
+      'qr timer': data.qrProcessingTimer ? data.qrProcessingTimer + 's' : null,
+      websocket: data.webSocketUrl,
+      'api token': data.apiToken ? String(data.apiToken).slice(0, 6) + '•••••• (masked)' : null,
+      'open websocket': data.openWebSocket,
+    }) + '</div>';
+}
+
+function pagerHtml(pageable) {
+  if (!pageable) return '';
+  return '<div class="bar" style="border-top:1px solid var(--line);border-bottom:0">' +
+    '<span class="pill">page <b>' + esc(pageable.currentPage ?? '—') + '</b></span>' +
+    '<span class="pill">per page <b>' + esc(pageable.rowPerPage ?? '—') + '</b></span>' +
+    '<span class="pill">total rows <b>' + esc(pageable.totalItem ?? pageable.totalItems ?? '—') + '</b></span>' +
+    (pageable.totalPage ? '<span class="pill">pages <b>' + esc(pageable.totalPage) + '</b></span>' : '') +
+    '</div>';
+}
+
+/** Status bar + typed renderer + raw JSON, for one API response. */
+function envelopeHtml(result, opts = {}, key) {
+  const json = result.json || {};
+  const ok = result.status >= 200 && result.status < 300 && json.status === 'SUCCESS';
+  const data = payload(result);
+  const explain = EXPLAIN[json.code];
+
+  // The portal intermittently answers 5xx with a stale-looking message
+  // ("Session Expired" on a perfectly good token), so offer a retry rather than
+  // letting it read as a credential problem.
+  const serverError = result.status >= 500 && key !== undefined
+    ? '<div class="note warn" style="margin:12px 13px 0"><b>Upstream server error ' + esc(result.status) + '</b> — ' +
+      'the portal answers this way intermittently; the message can say "Session Expired" even though the token is fine. ' +
+      '<button class="tiny" style="margin-top:8px" onclick="retry(' + key + ')">Retry</button></div>'
+    : '';
+
+  const bar = '<div class="bar">' +
+    '<span class="code" style="color:' + (ok ? 'var(--ok)' : result.status === 0 ? 'var(--muted)' : 'var(--bad)') + '">' +
+      esc(result.status || 'no response') + '</span>' +
+    '<span class="pill">' + esc(json.code ?? '') + '</span>' +
+    '<span class="pill">' + esc(result.ms) + ' ms</span>' +
+    (result.renewed ? '<span class="pill ok"><span class="dot"></span>session renewed</span>' : '') +
+    '<span class="sep" style="flex:1"></span>' +
+    '<button class="tiny ghost" onclick="copyJson(this)">Copy JSON</button>' +
+    '<span class="muted" style="font-size:12px">' + esc(json.message ?? '') + '</span>' +
+    '</div>';
+
+  const note = explain && !ok ? '<div class="note ' + (json.code === 'UPSTREAM_BLOCKED' ? 'bad' : 'warn') + '" style="margin:12px 13px 0">' +
+    '<b>' + esc(json.code) + '</b> — ' + esc(explain) + '</div>' : '';
+
+  const rendered = opts.render === false || data == null
+    ? '<div class="empty">' + esc(json.message || 'No data.') + '</div>'
+    : (opts.renderer ? opts.renderer(data) : renderData(data));
+
+  return bar + note + serverError + rendered +
+    '<details class="raw"><summary>Raw JSON envelope</summary><pre class="json" data-json="1">' +
+    esc(JSON.stringify(result.json, null, 2)) + '</pre></details>';
+}
+
+function copyJson(button) {
+  const pre = button.closest('.card').querySelector('pre[data-json]');
+  if (!pre) return;
+  navigator.clipboard.writeText(pre.textContent).then(() => { button.textContent = 'Copied'; setTimeout(() => (button.textContent = 'Copy JSON'), 1500); });
+}
+
+function loadingHtml(text) {
+  const row = (count, wide) => '<div class="row' + (wide ? ' wide' : '') + '">' +
+    Array.from({ length: count }, () => '<span class="sk"></span>').join('') + '</div>';
+  return '<div class="bar"><span class="spin" role="status" aria-label="Loading"></span>' +
+      '<span class="muted">' + esc(text) + '</span></div>' +
+    '<div class="skeleton" aria-hidden="true">' + row(4, true) + row(4) + row(3, true) + row(4) + '</div>';
+}
+
+async function into(elementId, path, opts = {}) {
+  const el = $(elementId);
+  if (!el) return null;
+  el.innerHTML = loadingHtml((opts.method || 'POST') + ' ' + path);
+  const r = await api(path, opts);
+  const key = retryKey++;
+  state.retry.set(key, { elementId, path, opts });
+  el.innerHTML = envelopeHtml(r, opts, key);
+  return r;
+}
+
+function retry(key) {
+  const job = state.retry.get(key);
+  if (job) into(job.elementId, job.path, job.opts);
+}
+
+/* ==================================================================== */
+/* views                                                                */
+/* ==================================================================== */
+
+const VIEWS = {
+  dashboard: { label: 'Dashboard', icon: '▦', title: 'Dashboard', sub: 'Balance, recent activity and settlement state', render: viewDashboard },
+  qr: { label: 'QR & payments', icon: '▣', title: 'QR & payments', sub: 'Dynamic, store and terminal QR codes', render: viewQr },
+  transactions: { label: 'Transactions', icon: '≡', title: 'Transaction report', sub: 'Search transactions over a date range', render: viewTransactions },
+  summary: { label: 'Summary', icon: '∑', title: 'Summary report', sub: 'Daily totals per terminal and network', render: viewSummary },
+  network: { label: 'Networks', icon: '◎', title: 'Issuer networks', sub: 'Networks this merchant can transact on', render: viewNetwork },
+  refunds: { label: 'Refunds', icon: '↩', title: 'Refunds', sub: 'Refundable transactions and reason codes', render: viewRefunds },
+  settlements: { label: 'Settlements', icon: '⇄', title: 'Settlement report', sub: 'Settlement batches over a date range', render: viewSettlements },
+  stores: { label: 'Stores', icon: '⌂', title: 'Stores & terminals', sub: 'Store list, terminals and per-store totals', render: viewStores },
+  users: { label: 'Users', icon: '☺', title: 'Users', sub: 'Portal users, roles and permissions', render: viewUsers },
+  reference: { label: 'Reference', icon: '⌗', title: 'Reference data', sub: 'Banks, refund reasons, roles, dashboard images', render: viewReference },
+  endpoints: { label: 'All endpoints', icon: '⌘', title: 'All endpoints', sub: 'Every route the bridge exposes, with a body editor', render: viewEndpoints },
+  session: { label: 'Session', icon: '⚿', title: 'Session', sub: 'Identity, token state and recent requests', render: viewSession },
+};
+
+const NAV_ORDER = ['dashboard', 'qr', 'transactions', 'summary', 'network', 'refunds', 'settlements', 'stores', 'users', 'reference', 'endpoints', 'session'];
+
+function renderNav() {
+  $('nav').innerHTML = NAV_ORDER.map((key) => {
+    const v = VIEWS[key];
+    const group = key === 'dashboard' ? '<div class="group">Overview</div>'
+      : key === 'transactions' ? '<div class="group">Reports</div>'
+      : key === 'stores' ? '<div class="group">Manage</div>'
+      : key === 'endpoints' ? '<div class="group">Developer</div>' : '';
+    const active = state.view === key;
+    return group + '<button data-view="' + key + '" class="' + (active ? 'active' : '') + '"' +
+      (active ? ' aria-current="page"' : '') + '>' +
+      '<span class="ic" aria-hidden="true">' + v.icon + '</span>' + esc(v.label) + '</button>';
+  }).join('');
+  $('nav').querySelectorAll('button[data-view]').forEach((btn) => {
+    btn.addEventListener('click', () => go(btn.dataset.view));
+  });
+}
+
+function go(key) {
+  if (!VIEWS[key]) key = 'dashboard';
+  state.view = key;
+  const view = VIEWS[key];
+  $('viewTitle').textContent = view.title;
+  $('viewSub').textContent = view.sub;
+  renderNav();
+  $('view').innerHTML = '';
+  view.render();
+}
+
+/* ---------- 1. dashboard ---------- */
+
+function viewDashboard() {
+  $('view').innerHTML =
+    '<div class="btnrow"><button class="ghost" onclick="loadBalance(); into(\'dashTxns\', \'/api/dashboard/transactions\', { body: {} })">Refresh</button></div>' +
+    '<div class="grid cols-4" id="balanceCards">' + skeleton('Loading balance…') + '</div>' +
+    '<div class="card"><h2>Recent transactions <span class="sep"></span>' +
+      '<button class="tiny" onclick="go(\'transactions\')">Open report</button></h2><div id="dashTxns">' + skeleton('Loading…') + '</div></div>' +
+    '<div class="card"><h2>Settlement statistic</h2><div id="dashSettlement">' + skeleton('Loading…') + '</div></div>';
+
+  loadBalance();
+  into('dashTxns', '/api/dashboard/transactions', { body: {} });
+  into('dashSettlement', '/api/dashboard/settlement', { body: {} });
+}
+
+function skeleton(text) {
+  return '<div class="bar"><span class="spin"></span><span class="muted">' + esc(text) + '</span></div>';
+}
+
+async function loadBalance() {
+  const r = await api('/api/dashboard/balance', { body: {} });
+  const data = payload(r);
+  const info = data?.settleUnsettleTxnInfo;
+  if (!info) {
+    $('balanceCards').innerHTML = '<div class="card"><div class="pad">' + statusOnly(r) +
+      '<div class="btnrow" style="margin-top:11px"><button class="tiny" onclick="loadBalance()">Retry</button></div></div></div>';
+    return;
+  }
+  const session = data.sessionSrlInfo || {};
+  $('balanceCards').innerHTML =
+    '<div class="stat hl"><div class="k">Settled</div><div class="v">' + money(info.totalSettleAmount) +
+      '</div><div class="f">' + esc(info.totalSettleTxnCount) + ' transaction(s)</div></div>' +
+    '<div class="stat warnish"><div class="k">Unsettled</div><div class="v">' + money(info.totalUnsettleAmount) +
+      '</div><div class="f">' + esc(info.totalUnsettleTxnCount) + ' transaction(s)</div></div>' +
+    '<div class="stat"><div class="k">Last session</div><div class="v small">' + esc(session.sessionSrlNo ?? '—') +
+      '</div><div class="f">' + esc(session.status ?? '—') + ' · ' + esc((session.sessionDate || '').slice(0, 10)) + '</div></div>' +
+    '<div class="stat"><div class="k">Settlement date</div><div class="v small">' + esc(session.settlementDate ?? '—') +
+      '</div><div class="f">' + esc(session.network ?? '—') + ' · ' + esc(session.currency ?? '—') + '</div></div>' +
+    '<div class="stat"><div class="k">Total collected</div><div class="v">' +
+      money((Number(info.totalSettleAmount) || 0) + (Number(info.totalUnsettleAmount) || 0)) +
+      '</div><div class="f">settled + unsettled</div></div>';
+  state.cache.balance = data;
+}
+
+function snippet(title, code) {
+  return '<div class="snip"><div class="t">' + esc(title) + '</div>' +
+    '<button class="tiny ghost" onclick="copyText(this)">Copy</button>' +
+    '<pre class="json" data-json="1">' + esc(code) + '</pre></div>';
+}
+
+function copyText(button) {
+  const pre = button.parentElement.querySelector('pre');
+  navigator.clipboard.writeText(pre.textContent).then(() => {
+    button.textContent = 'Copied';
+    setTimeout(() => { button.textContent = 'Copy'; }, 1600);
+  });
+}
+
+function statusOnly(r) {
+  const json = r.json || {};
+  return '<div class="note ' + (json.status === 'SUCCESS' ? 'ok' : 'warn') + '"><b>' + esc(json.code ?? '') + '</b> — ' +
+    esc(json.message ?? 'No data') + '</div>';
+}
+
+/* ---------- 2. QR ---------- */
+
+function viewQr() {
+  $('view').innerHTML =
+    '<div class="grid cols-2">' +
+      '<div class="card"><h2>Dynamic QR · amount</h2><div class="pad">' +
+        '<div class="filters" style="margin-bottom:12px">' +
+          selectField('qrStore', 'Store') + selectField('qrTerminal', 'Terminal') +
+          field('qrAmount', 'Amount (NPR)', 'number', '100') +
+          field('qrRemarks', 'Remarks', 'text', 'counter sale') +
+        '</div>' +
+        '<div class="btnrow"><button class="primary" onclick="genDynamicQr()">Generate QR</button>' +
+          '<button onclick="checkPayment()">Check for payment</button></div>' +
+        '<div class="muted" style="margin-top:9px;font-size:12px">Upstream opens a websocket for live payment ' +
+          'confirmation; the bridge cannot proxy that, so use <b>Check for payment</b> to poll recent transactions.</div>' +
+      '</div><div id="qrDynamicOut">' + emptyHint('Generate a QR to see it here.') + '</div></div>' +
+      '<div class="card"><h2>Static QR</h2><div class="pad">' +
+        '<div class="filters" style="margin-bottom:12px">' +
+          selectField('qrStaticStore', 'Store') + selectField('qrStaticTerminal', 'Terminal') +
+        '</div>' +
+        '<div class="btnrow"><button onclick="genStoreQr()">Store QR</button>' +
+          '<button onclick="genTerminalQr()">Terminal QR</button></div>' +
+      '</div><div id="qrStaticOut">' + emptyHint('Store QR needs a store; terminal QR needs a terminal.') + '</div></div>' +
+    '</div>' +
+    '<div class="card"><h2>Where the QR came from</h2><div class="pad muted" style="font-size:12.5px">' +
+      'Both are generated server-side by NepalPay: <code>nqr/generate</code> returns a transaction-bound QR ' +
+      '(<code>qrString</code>) plus a websocket channel, while <code>stores/nqr/generate</code> and ' +
+      '<code>stores/terminal/nqr/generate</code> return a static per-store or per-terminal image.' +
+    '</div></div>';
+
+  loadStoreOptions();
+}
+
+function emptyHint(text) {
+  return '<div class="empty">' + esc(text) + '</div>';
+}
+
+/**
+ * Refuse to send a request the portal will misreport.
+ *
+ * NepalPay answers a *missing* storeLabel with HTTP 500 and the message
+ * "Session Expired", which reads like a dead token. Guarding here keeps that
+ * confusing failure out of the console entirely.
+ */
+function missing(elementId, label) {
+  const el = $(elementId);
+  if (el && el.value) return false;
+  return label;
+}
+
+function needFields(checks, targetId) {
+  const absent = checks.map(([id, label]) => missing(id, label)).filter(Boolean);
+  if (!absent.length) return true;
+  if (targetId) {
+    $(targetId).innerHTML = '<div class="note warn"><b>Pick a value first</b> — ' + esc(absent.join(', ')) +
+      ' is required. NepalPay replies 500 "Session Expired" when a store label is missing, which looks like an expired session.</div>';
+  }
+  return false;
+}
+
+function needDates(fromId, toId, targetId) {
+  const from = $(fromId)?.value, to = $(toId)?.value;
+  if (from && to) {
+    const days = (new Date(to) - new Date(from)) / 864e5;
+    if (days < 0 || days > 90) {
+      $(targetId).innerHTML = '<div class="note warn"><b>Date range rejected</b> — upstream allows at most 90 days, and expects from ≤ to.</div>';
+      return false;
+    }
+    return true;
+  }
+  $(targetId).innerHTML = '<div class="note warn"><b>Dates required</b> — set both from and to.</div>';
+  return false;
+}
+
+async function loadStoreOptions() {
+  const r = await api('/api/stores', { body: {} });
+  const data = payload(r);
+  const stores = (data && Array.isArray(data.result) ? data.result : []).map((s) => s.storeName || s.storeLabel).filter(Boolean);
+  state.cache.stores = stores;
+  for (const id of ['qrStore', 'qrStaticStore', 'txnStore', 'sumStore', 'stStore', 'stTerminalStore']) {
+    const el = $(id);
+    if (!el) continue;
+    el.innerHTML = '<option value="">All stores</option>' + stores.map((s) => '<option value="' + esc(s) + '">' + esc(s) + '</option>').join('');
+  }
+  const terminals = collectTerminals(data);
+  state.cache.terminals = terminals;
+  for (const id of ['qrTerminal', 'qrStaticTerminal', 'txnTerminal', 'sumTerminal', 'stTerminal']) fillTerminalSelect(id, terminals);
+  await loadNetworks();
+}
+
+function collectTerminals(storeData) {
+  const set = new Set();
+  for (const store of (storeData?.result || [])) {
+    for (const terminal of (store.terminalListDtoList || [])) {
+      const name = terminal.terminal || terminal.terminalName || terminal.name;
+      if (name) set.add(name);
+    }
+  }
+  return [...set];
+}
+
+function fillTerminalSelect(id, terminals) {
+  const el = $(id);
+  if (!el) return;
+  el.innerHTML = '<option value="">All terminals</option>' + terminals.map((t) => '<option value="' + esc(t) + '">' + esc(t) + '</option>').join('');
+}
+
+async function loadNetworks() {
+  if (state.cache.networks.length) return;
+  const r = await api('/api/reports/network', { body: {} });
+  const data = payload(r);
+  state.cache.networks = Array.isArray(data) ? data.filter((v) => typeof v === 'string') : [];
+  for (const id of ['txnNetwork', 'sumNetwork', 'stNetwork']) {
+    const el = $(id);
+    if (!el) continue;
+    el.innerHTML = '<option value="">All networks</option>' +
+      state.cache.networks.map((n) => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('');
+  }
+}
+
+async function genDynamicQr() {
+  if (!needFields([['qrStore', 'store']], 'qrDynamicOut')) return;
+  const body = {
+    storeLabel: $('qrStore').value, terminal: $('qrTerminal').value,
+    amount: Number($('qrAmount').value || 0), remarks: $('qrRemarks').value,
+  };
+  const r = await into('qrDynamicOut', '/api/qr', { body });
+  const data = payload(r);
+  if (data?.qrString) {
+    // Remember what already exists, so "check for payment" can spot a new one.
+    const txns = await api('/api/dashboard/transactions', { body: {} });
+    for (const t of (payload(txns) || [])) if (t.instructionId) state.cache.qrIds.add(t.instructionId);
+    state.cache.lastQr = { amount: body.amount, at: Date.now() };
+  }
+}
+
+async function checkPayment() {
+  const el = $('qrDynamicOut');
+  const before = new Set(state.cache.qrIds);
+  el.insertAdjacentHTML('afterbegin', '<div class="bar" id="qrPollBar"><span class="spin"></span><span class="muted">Checking recent transactions…</span></div>');
+  const r = await api('/api/dashboard/transactions', { body: {} });
+  const rows = payload(r) || [];
+  const fresh = (Array.isArray(rows) ? rows : []).filter((t) => t.instructionId && !before.has(t.instructionId));
+  const bar = $('qrPollBar');
+  if (bar) {
+    bar.className = 'bar';
+    bar.innerHTML = fresh.length
+      ? '<span class="pill ok"><span class="dot"></span>new payment: ' + esc(fresh[0].instructionId) + ' · ' + money(fresh[0].amount) + '</span>'
+      : '<span class="pill warn"><span class="dot"></span>no new payment yet (' + esc((Array.isArray(rows) ? rows.length : 0)) + ' recent rows checked)</span>';
+  }
+}
+
+async function genStoreQr() {
+  if (!needFields([['qrStaticStore', 'store']], 'qrStaticOut')) return;
+  await into('qrStaticOut', '/api/qr/store', { body: { storeLabel: $('qrStaticStore').value } });
+}
+
+async function genTerminalQr() {
+  if (!needFields([['qrStaticStore', 'store'], ['qrStaticTerminal', 'terminal']], 'qrStaticOut')) return;
+  await into('qrStaticOut', '/api/qr/terminal', {
+    body: { storeLabel: $('qrStaticStore').value, terminal: $('qrStaticTerminal').value },
+  });
+}
+
+/* ---------- 3. transactions ---------- */
+
+function viewTransactions() {
+  $('view').innerHTML =
+    '<div class="card"><h2>Filters</h2><div class="pad">' +
+      '<div class="filters">' +
+        field('txnFrom', 'From', 'date', daysAgo(7)) + field('txnTo', 'To', 'date', today()) +
+        selectField('txnStore', 'Store') + selectField('txnTerminal', 'Terminal') +
+        selectField('txnNetwork', 'Network') +
+        field('txnPayer', 'Payer mobile', 'text', '') + field('txnQr', 'NQR txn id', 'text', '') +
+        field('txnRows', 'Rows', 'number', '10') +
+      '</div>' +
+      '<div class="muted" style="margin-top:9px;font-size:12px">Dates are local (NPT), matching the portal. ' +
+        'Upstream refuses ranges wider than 90 days.</div>' +
+      '<div class="btnrow" style="margin-top:12px">' +
+        '<button class="primary" onclick="runTransactions()">Search</button>' +
+        '<button onclick="shiftPage(\'txn\', -1)">‹ Prev</button>' +
+        '<span class="pill" id="txnPage">page 1</span>' +
+        '<button onclick="shiftPage(\'txn\', 1)">Next ›</button>' +
+        '<span class="sep" style="flex:1"></span>' +
+        '<button class="ghost" onclick="exportNote(\'transaction\', \'csv\')">Export CSV</button>' +
+        '<button class="ghost" onclick="exportNote(\'transaction\', \'excel\')">Export Excel</button>' +
+      '</div>' +
+    '</div><div id="txnOut">' + emptyHint('Run a search to see transactions.') + '</div></div>';
+  loadStoreOptions();
+  runTransactions();
+}
+
+const pages = { txn: { page: 1, size: 10 }, sum: { page: 1, size: 10 }, st: { page: 1, size: 10 }, refund: { page: 1, size: 10 }, settle: { page: 1, size: 10 }, users: { page: 1, size: 10 } };
+
+function shiftPage(kind, delta) {
+  const p = pages[kind];
+  p.page = Math.max(1, p.page + delta);
+  const badge = $('txnPage');
+  if (badge) badge.textContent = 'page ' + p.page;
+  if (kind === 'txn') runTransactions();
+}
+
+function txnBody() {
+  return {
+    fromDate: $('txnFrom').value, toDate: $('txnTo').value,
+    storeLabel: $('txnStore').value, terminal: $('txnTerminal').value,
+    issuerNetwork: $('txnNetwork').value, payerMobileNumber: $('txnPayer').value,
+    nqrTxnId: $('txnQr').value,
+    pageable: { currentPage: pages.txn.page, rowPerPage: Number($('txnRows').value || 10), paginated: true, enable: true },
+  };
+}
+
+async function runTransactions() {
+  if (!needDates('txnFrom', 'txnTo', 'txnOut')) return;
+  const r = await into('txnOut', '/api/reports/transactions', { body: txnBody() });
+  const data = payload(r);
+  if (data?.pageable) {
+    const badge = $('txnPage');
+    if (badge) badge.textContent = 'page ' + (data.pageable.currentPage || 1) + (data.pageable.totalPage ? ' / ' + data.pageable.totalPage : '');
+  }
+}
+
+function exportNote(kind, file) {
+  toast('Upstream exposes /download/' + kind + '/list?fileType=' + file + ' — binary exports are not proxied by the bridge yet.', false);
+}
+
+/* ---------- 4. summary / 5. network / 7. settlements ---------- */
+
+function viewSummary() {
+  $('view').innerHTML =
+    '<div class="card"><h2>Filters</h2><div class="pad"><div class="filters">' +
+      field('sumFrom', 'From', 'date', daysAgo(7)) + field('sumTo', 'To', 'date', today()) +
+      selectField('sumStore', 'Store') + selectField('sumTerminal', 'Terminal') + selectField('sumNetwork', 'Network') +
+      field('sumRows', 'Rows', 'number', '10') +
+    '</div><div class="btnrow" style="margin-top:12px"><button class="primary" onclick="runSummary()">Search</button></div></div>' +
+    '<div id="sumOut">' + emptyHint('Run a search for daily totals.') + '</div></div>';
+  loadStoreOptions();
+  runSummary();
+}
+
+async function runSummary() {
+  if (!needDates('sumFrom', 'sumTo', 'sumOut')) return;
+  await into('sumOut', '/api/reports/summary', {
+    body: {
+      fromDate: $('sumFrom').value, toDate: $('sumTo').value,
+      storeLabel: $('sumStore').value, terminal: $('sumTerminal').value, issuerNetwork: $('sumNetwork').value,
+      pageable: { currentPage: 1, rowPerPage: Number($('sumRows').value || 10), paginated: true, enable: true },
+    },
+  });
+}
+
+function viewNetwork() {
+  $('view').innerHTML =
+    '<div class="card"><h2>Issuer networks</h2><div id="netOut">' + skeleton('Loading…') + '</div></div>';
+  into('netOut', '/api/reports/network', { body: {} });
+}
+
+function viewSettlements() {
+  $('view').innerHTML =
+    '<div class="card"><h2>Filters</h2><div class="pad"><div class="filters">' +
+      field('stFrom', 'From', 'date', daysAgo(14)) + field('stTo', 'To', 'date', today()) +
+      selectField('stNetwork', 'Network') + field('stRows', 'Rows', 'number', '10') +
+    '</div><div class="btnrow" style="margin-top:12px"><button class="primary" onclick="runSettlements()">Search</button></div></div>' +
+    '<div id="stOut">' + emptyHint('Run a search for settlement batches.') + '</div></div>';
+  loadStoreOptions();
+  runSettlements();
+}
+
+async function runSettlements() {
+  if (!needDates('stFrom', 'stTo', 'stOut')) return;
+  await into('stOut', '/api/reports/settlements', {
+    body: {
+      fromDate: $('stFrom').value, toDate: $('stTo').value, issuerNetwork: $('stNetwork').value,
+      pageable: { currentPage: 1, rowPerPage: Number($('stRows').value || 10), paginated: true, enable: true },
+    },
+  });
+}
+
+/* ---------- 6. refunds ---------- */
+
+function viewRefunds() {
+  $('view').innerHTML =
+    '<div class="grid cols-2">' +
+      '<div class="card"><h2>Refundable transactions</h2><div class="pad"><div class="filters">' +
+        field('rfFrom', 'From', 'date', daysAgo(14)) + field('rfTo', 'To', 'date', today()) +
+        field('rfTxn', 'NQR txn id', 'text', '') + field('rfPayer', 'Payer mobile', 'text', '') +
+      '</div><div class="btnrow" style="margin-top:12px"><button class="primary" onclick="runRefunds()">Search</button>' +
+        '<span class="muted" style="font-size:12px">Refunds need the REFUND_MAKER authority; the API rejects them otherwise.</span>' +
+      '</div></div><div id="rfOut">' + emptyHint('Search to list refundable transactions.') + '</div></div>' +
+      '<div class="card"><h2>Reason codes</h2><div id="rfReasons">' + skeleton('Loading…') + '</div></div>' +
+    '</div>';
+  runRefunds();
+  into('rfReasons', '/api/refunds/reasons', { method: 'GET' });
+}
+
+async function runRefunds() {
+  if (!needDates('rfFrom', 'rfTo', 'rfOut')) return;
+  const r = await into('rfOut', '/api/refunds', {
+    body: {
+      nqrTxnId: $('rfTxn').value, payerMobileNumber: $('rfPayer').value,
+      fromDate: $('rfFrom').value, toDate: $('rfTo').value,
+      pageable: { currentPage: 1, rowPerPage: 10, paginated: true, enable: true },
+    },
+  });
+  const rows = (payload(r)?.result) || [];
+  state.cache.refundable = rows;
+}
+
+/* ---------- 8. stores ---------- */
+
+function viewStores() {
+  $('view').innerHTML =
+    '<div class="card"><h2>Stores <span class="sep"></span><button class="tiny" onclick="runStores()">Reload</button></h2>' +
+      '<div id="storeOut">' + skeleton('Loading stores…') + '</div></div>' +
+    '<div class="grid cols-2">' +
+      '<div class="card"><h2>Per-store totals</h2><div class="pad"><div class="filters">' +
+        selectField('stStore', 'Store') + selectField('stTerminal', 'Terminal') +
+      '</div><div class="btnrow" style="margin-top:12px"><button class="primary" onclick="runStoreSummary()">Load totals</button>' +
+      '<button onclick="genStoreQrFromSummary()">Store QR</button></div></div>' +
+      '<div id="stSummary">' + emptyHint('Pick a store to see terminals and totals.') + '</div></div>' +
+      '<div class="card"><h2>Terminals for a store</h2><div class="pad"><div class="filters">' +
+        selectField('stTerminalStore', 'Store') +
+      '</div><div class="btnrow" style="margin-top:12px"><button onclick="runTerminals()">List terminals</button></div></div>' +
+      '<div id="stTerminals">' + emptyHint('Lists the terminals registered against a store.') + '</div></div>' +
+    '</div>';
+  loadStoreOptions();
+  runStores();
+}
+
+async function runStores() {
+  const r = await into('storeOut', '/api/stores', { body: { pageable: { currentPage: 1, rowPerPage: 50 } } });
+  const data = payload(r);
+  const rows = (data && Array.isArray(data.result) ? data.result : []);
+  const el = $('storeOut');
+  if (!rows.length || !el) return;
+  el.querySelectorAll('tbody tr').forEach((tr, index) => {
+    tr.classList.add('clickable');
+    tr.addEventListener('click', () => {
+      const name = rows[index]?.storeName || rows[index]?.storeLabel;
+      if (!name) return;
+      if ($('stStore')) $('stStore').value = name;
+      if ($('stTerminalStore')) $('stTerminalStore').value = name;
+      if ($('qrStaticStore')) $('qrStaticStore').value = name;
+      if ($('stSummary')) $('stSummary').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      runStoreSummary();
+    });
+  });
+  const terminalSet = new Set(state.cache.terminals);
+  for (const store of rows) {
+    for (const terminal of (store.terminalListDtoList || [])) {
+      const name = terminal.terminal || terminal.terminalName || terminal.name;
+      if (name) terminalSet.add(name);
+    }
+  }
+  state.cache.terminals = [...terminalSet];
+  for (const id of ['qrTerminal', 'qrStaticTerminal', 'txnTerminal', 'sumTerminal', 'stTerminal']) fillTerminalSelect(id, state.cache.terminals);
+}
+
+async function runStoreSummary() {
+  if (!needFields([['stStore', 'store']], 'stSummary')) return;
+  await into('stSummary', '/api/stores/summary', {
+    body: { storeLabel: $('stStore').value, terminal: $('stTerminal').value },
+  });
+}
+
+function genStoreQrFromSummary() {
+  const store = $('stStore').value || $('stTerminalStore').value;
+  if (!store) return toast('Pick a store first.', false);
+  go('qr');
+  setTimeout(() => { if ($('qrStaticStore')) $('qrStaticStore').value = store; genStoreQr(); }, 60);
+}
+
+async function runTerminals() {
+  if (!needFields([['stTerminalStore', 'store']], 'stTerminals')) return;
+  await into('stTerminals', '/api/stores/terminals', {
+    body: { storeLabel: $('stTerminalStore').value, terminal: '' },
+  });
+}
+
+/* ---------- 9. users ---------- */
+
+function viewUsers() {
+  $('view').innerHTML =
+    '<div class="grid cols-2">' +
+      '<div class="card"><h2>Users</h2><div class="pad"><div class="filters">' +
+        field('usName', 'Username', 'text', '') + field('usMobile', 'Mobile', 'text', '') +
+      '</div><div class="btnrow" style="margin-top:12px"><button class="primary" onclick="runUsers()">Search</button></div></div>' +
+      '<div id="usOut">' + emptyHint('Search users for this merchant.') + '</div></div>' +
+      '<div class="card"><h2>Assignable roles</h2><div id="usRoles">' + skeleton('Loading…') + '</div></div>' +
+    '</div>';
+  runUsers();
+  into('usRoles', '/api/users/roles', { method: 'GET' });
+}
+
+async function runUsers() {
+  await into('usOut', '/api/users', {
+    body: {
+      username: $('usName').value, mobileNumber: $('usMobile').value,
+      pageable: { currentPage: 1, rowPerPage: 10 },
+    },
+  });
+}
+
+/* ---------- 10. reference ---------- */
+
+function viewReference() {
+  $('view').innerHTML =
+    '<div class="card"><h2>Acquirer banks <span class="sep"></span><span class="muted" style="font-size:11.5px">POST /api/bank/list</span></h2>' +
+      '<div id="refBanks">' + skeleton('Loading banks…') + '</div></div>' +
+    '<div class="grid cols-2">' +
+      '<div class="card"><h2>Dashboard images</h2><div id="refImages">' + skeleton('Loading…') + '</div></div>' +
+      '<div class="card"><h2>Refund reasons</h2><div id="refReasons">' + skeleton('Loading…') + '</div></div>' +
+    '</div>';
+  into('refBanks', '/api/banks', { body: {} });
+  into('refReasons', '/api/refunds/reasons', { method: 'GET' });
+  renderDashboardImages();
+}
+
+async function renderDashboardImages() {
+  const r = await api('/api/dashboard/images', { method: 'GET' });
+  const el = $('refImages');
+  if (!el) return;
+  const urls = payload(r);
+  if (!Array.isArray(urls)) { el.innerHTML = envelopeHtml(r); return; }
+  el.innerHTML = '<div class="chips">' + urls.map((url) =>
+    '<a class="pill" href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(String(url).split('/').pop()) + '</a>').join('') + '</div>' +
+    '<details class="raw"><summary>Raw JSON envelope</summary><pre class="json" data-json="1">' + esc(JSON.stringify(r.json, null, 2)) + '</pre></details>';
+}
+
+/* ---------- 11. all endpoints ---------- */
+
+let SPECS = [];
+
+async function viewEndpoints() {
+  $('view').innerHTML = '<div class="card"><h2>Endpoint catalogue <span class="sep"></span>' +
+    '<span class="muted" style="font-size:11.5px">GET /api</span></h2><div id="epList">' + skeleton('Loading catalogue…') + '</div></div>';
+  const r = await api('/api', { method: 'GET', auth: false });
+  SPECS = (r.json.data?.endpoints) || [];
+  const el = $('epList');
+  if (!SPECS.length) { el.innerHTML = envelopeHtml(r); return; }
+  el.innerHTML = SPECS.map((spec, index) => {
+    const [method, path] = spec.route.split(' ');
+    return '<div class="ep"><div class="hdr">' +
+      '<span class="pill ' + (method === 'GET' ? '' : 'ok') + '">' + esc(method) + '</span>' +
+      '<span class="m">' + esc(path) + '</span>' +
+      '<span class="sep" style="flex:1"></span>' +
+      '<span class="u">' + esc(spec.upstream) + '</span>' +
+      '<button class="tiny" onclick="toggleEp(\'' + index + '\')">Body &amp; send</button></div>' +
+      '<div class="muted" style="margin-top:5px;font-size:12px">' + esc(spec.title) + '</div>' +
+      '<div id="ep-body-' + index + '" class="hidden" style="margin-top:11px">' +
+        (method === 'GET'
+          ? '<div class="muted" style="font-size:12px">No body — the Worker injects identity server-side.</div>'
+          : '<textarea id="ep-json-' + index + '" spellcheck="false" style="min-height:120px">' +
+            esc(JSON.stringify(spec.defaults || {}, null, 2)) + '</textarea>') +
+        '<div class="btnrow" style="margin-top:9px"><button class="primary" onclick="sendEp(\'' + index + '\')">Send</button>' +
+        '<button class="ghost" onclick="toast(\'Identity fields are injected from your session.\', true)">Why no merchantCode?</button></div>' +
+        '<div id="ep-out-' + index + '" style="margin-top:11px"></div>' +
+      '</div></div>';
+  }).join('');
+}
+
+function toggleEp(index) {
+  $('ep-body-' + index).classList.toggle('hidden');
+}
+
+async function sendEp(index) {
+  const spec = SPECS[index];
+  const [method, path] = spec.route.split(' ');
+  const box = $('ep-json-' + index);
+  let body;
+  if (method !== 'GET' && box) {
+    try { body = JSON.parse(box.value || '{}'); }
+    catch (err) { $('ep-out-' + index).innerHTML = '<div class="note bad">Invalid JSON: ' + esc(err.message) + '</div>'; return; }
+  }
+  await into('ep-out-' + index, path, { method, body });
+}
+
+/* ---------- 12. session ---------- */
+
+function viewSession() {
+  const i = state.identity || {};
+  $('view').innerHTML =
+    '<div class="grid cols-2">' +
+      '<div class="card"><h2>Identity</h2><div class="pad">' + kvHtml({
+        merchant: i.merchantLegalName, 'merchant code': i.merchantCode, user: i.username,
+        roles: i.roles, authorities: (i.authorities || []).join(', '),
+        'password change': i.passwordChangeStatus, 'refund enabled': i.refundEnable,
+        'token expires': i.expiresAt ? new Date(i.expiresAt).toLocaleString() + ' (' + countdown(i.expiresAt) + ')' : '—',
+        'auto renewal': i.autoRenew ? 'on' : 'off',
+        'bridge headers': state.health?.headerMode ?? '—',
+        'session token': state.session ? state.session.length + ' chars (sealed, holds the real tokens)' : '—',
+      }) + '</div><div class="pad">' + kvHtml({ 'upstream': state.health?.upstream ?? '—' }) + '</div></div>' +
+      '<div class="card"><h2>Session actions</h2><div class="pad"><div class="btnrow">' +
+        '<button class="primary" onclick="openMe()">GET /api/auth/me</button>' +
+        '<button onclick="doRefresh()">POST /api/auth/refresh</button>' +
+        '<button onclick="copyToken()">Copy session token</button>' +
+        '<button class="ghost" onclick="doLogout()">Sign out</button>' +
+      '</div>' +
+      '<div class="note" style="margin-top:12px">Sessions are stateless and AES-GCM sealed with the Worker secret. ' +
+      'NepalPay\'s access token (60 min) and refresh token (24 h) live inside the sealed blob, never in this page.</div>' +
+      '</div><div id="meOut">' + emptyHint('Call /api/auth/me to inspect the session.') + '</div></div>' +
+    '</div>' +
+    '<div class="card"><h2>Use it from your site or app</h2><div class="pad">' +
+      '<div class="note" style="margin-bottom:14px">The bridge ships a zero-dependency client at ' +
+        '<code>' + esc(location.origin) + '/nepalpay.js</code> — it signs in, stores the session, absorbs ' +
+        'renewals, and throws typed errors with a <code>help</code> field. ESM entry point: ' +
+        '<code>/nepalpay.mjs</code>. Embeddable QR page: <code>/pay</code>.</div>' +
+      snippet('Browser — script tag',
+        '<script src="' + location.origin + '/nepalpay.js"><\/script>\n' +
+        '<script>\n' +
+        '  const np = NepalPay.createClient({ baseUrl: location.origin });\n' +
+        '  await np.login(\'username\', \'password\');        // once per user\n' +
+        '  const balance = await np.balance();            // { settled, unsettled, total }\n' +
+        '  const qr = await np.createQr({ amount: 250, storeLabel: \'Store1\' });\n' +
+        '  document.querySelector(\'img\').src = qr.qrString;\n' +
+        '<\/script>') +
+      snippet('Embeddable QR widget (iframe, session sent by postMessage)',
+        '<div id="pay"></div>\n' +
+        '<script src="/nepalpay.js"><\/script>\n' +
+        '<script>\n' +
+        '  const np = NepalPay.createClient({ baseUrl: location.origin });\n' +
+        '  const { session } = await np.login(user, pass);\n' +
+        '  NepalPay.payWidget(\'#pay\', {\n' +
+        '    baseUrl: location.origin, session, amount: 250, storeLabel: \'Store1\',\n' +
+        '    onPaid: (p) => console.log(\'paid\', p.transaction.instructionId),\n' +
+        '  });\n' +
+        '<\/script>') +
+      snippet('Server / app — ESM',
+        'import { createClient } from \'https://<your-worker>.workers.dev/nepalpay.mjs\';\n\n' +
+        'const np = createClient({ baseUrl, session: process.env.NP_SESSION });\n' +
+        'const { result } = await np.reports.transactions({ from: \'2026-09-01\', to: \'2026-09-24\' });') +
+      '</div></div>' +
+    '<div class="card"><h2>Request history <span class="sep"></span><span class="muted" style="font-size:11.5px">last ' +
+      esc(state.history.length) + '</span></h2><div id="histOut">' + historyHtml() + '</div></div>';
+}
+
+function historyHtml() {
+  if (!state.history.length) return '<div class="empty">No requests yet.</div>';
+  return '<div class="scroll"><table><thead><tr><th>status</th><th>route</th><th>code</th><th class="num">ms</th><th class="num">bytes</th></tr></thead><tbody>' +
+    state.history.map((r) => {
+      const color = r.status >= 200 && r.status < 300 ? 'var(--ok)' : r.status === 0 ? 'var(--muted)' : 'var(--bad)';
+      return '<tr><td class="num" style="color:' + color + '">' + esc(r.status || '—') + '</td>' +
+        '<td>' + esc(r.method + ' ' + r.path) + '</td><td class="num">' + esc(r.json?.code ?? '') + '</td>' +
+        '<td class="num">' + esc(r.ms) + '</td><td class="num">' + esc(r.bytes) + '</td></tr>';
+    }).join('') + '</tbody></table></div>';
+}
+
+async function openMe() { await into('meOut', '/api/auth/me', { method: 'GET' }); }
+
+function copyToken() {
+  navigator.clipboard.writeText(state.session)
+    .then(() => toast('Session token copied.', true))
+    .catch(() => toast('Clipboard blocked — token is ' + state.session.length + ' chars.', false));
+}
+
+/* ==================================================================== */
+/* small form helpers                                                   */
+/* ==================================================================== */
+
+function field(id, label, type, value) {
+  return '<div class="field"><label for="' + id + '">' + esc(label) + '</label>' +
+    '<input id="' + id + '" type="' + type + '" value="' + esc(value) + '" /></div>';
+}
+
+function selectField(id, label) {
+  return '<div class="field"><label for="' + id + '">' + esc(label) + '</label><select id="' + id + '"><option value="">All</option></select></div>';
+}
+
+/* ==================================================================== */
+/* boot                                                                 */
+/* ==================================================================== */
+
+(async function boot() {
+  $('loginForm').addEventListener('submit', doLogin);
+  state.session = restoreSession();
+
+  if (state.session) {
+    $('login').classList.add('hidden');
+    $('shell').classList.remove('hidden');
+    renderSession();
+    loadHealth();
+    const me = await api('/api/auth/me', { method: 'GET' });
+    if (me.json.status === 'SUCCESS') {
+      state.identity = me.json.data;
+      state.identity.expiresAt = me.json.data.expiresAt;
+      renderSession();
+    } else {
+      // A stale token should not look like a working session.
+      setSession('');
+      $('shell').classList.add('hidden');
+      $('login').classList.remove('hidden');
+      showLoginError('Stored session is no longer valid (' + (me.json.code || me.status) + '). Sign in again.');
+      return;
+    }
+  }
+
+  if (!state.session) return;
+  go('dashboard');
+
+  // Keep the expiry countdown honest without polling the API.
+  setInterval(() => { if (state.view === 'session' || true) $('sideExpiry').textContent = state.identity?.expiresAt ? countdown(state.identity.expiresAt) : '—'; }, 1000);
+})();
+</script>
+</body>
+</html>

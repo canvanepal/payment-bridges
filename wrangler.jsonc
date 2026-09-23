@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nepalpay-bridge",
+  "main": "src/nepalpay/index.ts",
+  "compatibility_date": "2026-09-21",
+  "assets": {
+    "directory": "./public"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "NEPALPAY_BASE_URL": "https://business.nepalpay.com.np",
+    "NEPALPAY_REFRESH_PATH": "/backend/api/auth/refresh-token",
+    "NEPALPAY_REFRESH_STYLE": "body",
+    "ALLOWED_ORIGINS": "",
+    "LOGIN_RATE_LIMIT_PER_MINUTE": "10",
+    "NEPALPAY_HEADER_MODE": "minimal",
+    "DEBUG_UPSTREAM": "0"
+  }
+}
