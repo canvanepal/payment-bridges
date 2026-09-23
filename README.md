@@ -28,6 +28,45 @@ plumbing in `src/shared/`.
 | Config | `wrangler.jsonc` | `wrangler.fonepay.jsonc` |
 | Console | `public/` | `public-fonepay/` |
 
+## Deployed
+
+Both Workers are live on Cloudflare's `workers.dev` subdomain. A site or app does
+not need any of this repository — it only needs the base URL:
+
+| Worker | Base URL |
+| --- | --- |
+| `nepalpay-bridge` | `https://nepalpay-bridge.aashmatimalsina275.workers.dev` |
+| `fonepay-bridge` | `https://fonepay-bridge.aashmatimalsina275.workers.dev` |
+
+```js
+const API = 'https://fonepay-bridge.aashmatimalsina275.workers.dev';
+
+const { data } = await fetch(`${API}/api/auth/login`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ emailOrUsername, password }),
+}).then((r) => r.json());
+
+localStorage.setItem('fp_session', data.session);
+```
+
+Every other call is the same base URL plus a route from the table below, with
+`Authorization: Bearer <session>`. Both consoles are served at each Worker's own
+root, signed in with a real merchant account.
+
+**Verified live** on 2026-09-24 through Cloudflare's egress: NepalPay signs in,
+lists stores and reads transactions, and renews its token; Fonepay runs the
+corporate lookup and reaches the gateway (answered `401` for a deliberately
+nonexistent identifier). Fonepay's edge accepts Cloudflare's egress, which is
+worth knowing — NepalPay's needed a header fix before it did.
+
+> Both endpoints are **open**: anyone who finds the URL can use them as a
+> credential relay. That is fine while wiring a site up and not fine afterwards —
+> see [Security notes](#security-notes).
+
+An existing site adapts by pointing its base URL at the right Worker. To run your
+own copies instead, the rest of this file covers setup and deployment.
+
 ## Quick start
 
 ```bash

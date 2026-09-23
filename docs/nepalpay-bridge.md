@@ -59,7 +59,7 @@ set a `DIAG_TOKEN` secret and call:
 
 ```bash
 curl -H "Authorization: Bearer $DIAG_TOKEN" \
-  https://<your-worker>.workers.dev/api/diag/matrix
+  https://nepalpay-bridge.aashmatimalsina275.workers.dev/api/diag/matrix
 ```
 
 It runs every profile against the sign-in endpoint with an empty body and reports
@@ -253,9 +253,9 @@ integration is a script tag rather than a hand-rolled fetch layer:
 ### Browser
 
 ```html
-<script src="https://<your-worker>.workers.dev/nepalpay.js"></script>
+<script src="https://nepalpay-bridge.aashmatimalsina275.workers.dev/nepalpay.js"></script>
 <script>
-  const np = NepalPay.createClient({ baseUrl: 'https://<your-worker>.workers.dev' });
+  const np = NepalPay.createClient({ baseUrl: 'https://nepalpay-bridge.aashmatimalsina275.workers.dev' });
 
   await np.login('username', 'password');      // once per user session
   const balance = await np.balance();          // { settled, unsettled, total, session }
@@ -267,7 +267,7 @@ integration is a script tag rather than a hand-rolled fetch layer:
 ### App / server
 
 ```js
-import { createClient } from 'https://<your-worker>.workers.dev/nepalpay.mjs';
+import { createClient } from 'https://nepalpay-bridge.aashmatimalsina275.workers.dev/nepalpay.mjs';
 
 const np = createClient({ baseUrl, session: process.env.NP_SESSION });
 const { result } = await np.reports.transactions({ from: '2026-09-01', to: '2026-09-24' });
@@ -479,7 +479,7 @@ bodies — which is what the console's *All endpoints* view is built from.
 ## Frontend usage
 
 ```js
-const API = 'https://nepalpay-bridge.<your-subdomain>.workers.dev';
+const API = 'https://nepalpay-bridge.aashmatimalsina275.workers.dev';
 
 let session = null; // keep in memory, or sessionStorage
 
