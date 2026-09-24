@@ -9,6 +9,16 @@
   "observability": {
     "enabled": true
   },
+  // Edge-wide sign-in throttle. Especially relevant here: renewal re-signs in
+  // with the stored password, so a runaway login loop is a password-guessing
+  // loop against the bank.
+  "ratelimits": [
+    {
+      "name": "LOGIN_RATE_LIMITER",
+      "namespace_id": "1002",
+      "simple": { "limit": 10, "period": 60 }
+    }
+  ],
   "vars": {
     "FONEPAY_API_BASE_URL": "https://corporate-kong.fonepay.com/corporate/api",
     "FONEPAY_AUTH_BASE_URL": "https://corporate-kong.fonepay.com/corporate/auth",

@@ -2,6 +2,7 @@
   "name": "payment-bridges",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Cloudflare Workers that front the NepalPay merchant portal and the Fonepay corporate portal.",
   "scripts": {

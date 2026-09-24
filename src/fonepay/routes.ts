@@ -30,9 +30,50 @@ export interface FonepayRouteSpec {
   };
   /** `merchant` verifies any `merchantId` against the session's linked merchants. */
   scope?: 'merchant' | 'none';
+  /**
+   * When set, a successful response is reused for this many seconds instead of
+   * re-calling the gateway. Keyed by account scope plus the built request, so
+   * callers of one corporate account share the answer and no other account can
+   * see it. For reference data only — never for anything that changes minute to
+   * minute.
+   */
+  cacheSeconds?: number;
 }
 
 const today = () => new Date().toISOString().slice(0, 10);
+
+/**
+ * The dynamic-QR route. Named so the collect flow reuses the exact same spec the
+ * route table exposes, instead of duplicating an upstream path that could drift.
+ */
+export const QR_DYNAMIC_SPEC: FonepayRouteSpec = {
+  path: '/qr/dynamic',
+  upstream: '/corporate/api/v1/merchant-collection/linked-merchants/{merchantId}/qr/dynamic',
+  method: 'POST',
+  title: 'Dynamic QR for an amount — returns qrMessage plus a websocket URL',
+  params: ['merchantId'],
+  bodyKeys: ['amount', 'remarks', 'orderId', 'subMerchantId', 'terminalId'],
+  defaults: { body: { amount: 1, remarks: 'Test payment', orderId: 'INV-1' } },
+};
+
+/** The filtered-collection-report route, reused by the collect status scan. */
+export const TRANSACTIONS_SPEC: FonepayRouteSpec = {
+  path: '/transactions',
+  upstream: '/corporate/api/v1/merchant-collection/collections/transactions/filtered',
+  method: 'POST',
+  title: 'Collection transactions for a date range',
+  params: ['page', 'size', 'fromTransmissionDateTime', 'toTransmissionDateTime'],
+  defaults: {
+    query: {
+      page: 0,
+      size: 25,
+      fromTransmissionDateTime: today(),
+      toTransmissionDateTime: today(),
+    },
+    body: { merchantId: '', subMerchantId: '', terminalId: '' },
+  },
+  bodyKeys: ['merchantId', 'subMerchantId', 'terminalId'],
+};
 
 /**
  * The curated surface. Paths, query keys, bodies and success codes were read out
@@ -82,23 +123,7 @@ export const FONEPAY_ROUTES: FonepayRouteSpec[] = [
   },
 
   /* --- collections ----------------------------------------------------- */
-  {
-    path: '/transactions',
-    upstream: '/corporate/api/v1/merchant-collection/collections/transactions/filtered',
-    method: 'POST',
-    title: 'Collection transactions for a date range',
-    params: ['page', 'size', 'fromTransmissionDateTime', 'toTransmissionDateTime'],
-    defaults: {
-      query: {
-        page: 0,
-        size: 25,
-        fromTransmissionDateTime: today(),
-        toTransmissionDateTime: today(),
-      },
-      body: { merchantId: '', subMerchantId: '', terminalId: '' },
-    },
-    bodyKeys: ['merchantId', 'subMerchantId', 'terminalId'],
-  },
+  TRANSACTIONS_SPEC,
   {
     path: '/transactions/summary',
     upstream: '/corporate/api/v1/merchant-collection/collections/transactions/summary',
@@ -117,6 +142,7 @@ export const FONEPAY_ROUTES: FonepayRouteSpec[] = [
     method: 'GET',
     title: 'The filter tree the portal uses on the transactions screen',
     scope: 'none',
+    cacheSeconds: 900,
   },
   {
     path: '/transactions/detail',
@@ -164,15 +190,7 @@ export const FONEPAY_ROUTES: FonepayRouteSpec[] = [
     params: ['merchantId', 'subMerchantId', 'terminalId'],
     defaults: { query: { subMerchantId: '', terminalId: '' } },
   },
-  {
-    path: '/qr/dynamic',
-    upstream: '/corporate/api/v1/merchant-collection/linked-merchants/{merchantId}/qr/dynamic',
-    method: 'POST',
-    title: 'Dynamic QR for an amount — returns qrMessage plus a websocket URL',
-    params: ['merchantId'],
-    bodyKeys: ['amount', 'remarks', 'orderId', 'subMerchantId', 'terminalId'],
-    defaults: { body: { amount: 1, remarks: 'Test payment', orderId: 'INV-1' } },
-  },
+  QR_DYNAMIC_SPEC,
 
   /* --- profile, users and reports -------------------------------------- */
   {

@@ -127,13 +127,56 @@ const server = createServer(async (req, res) => {
     });
   }
 
+  if (path === '/backend/api/nqr/generate') {
+    if (!auth.startsWith('Bearer ')) return fail(401, '001', 'missing bearer token');
+    if (!body.amount || !body.userDetail) return fail(400, '001', 'bad request');
+    collectState.counter += 1;
+    collectState.traceId = `TRACE-${collectState.counter}`;
+    return ok({
+      validationTraceId: collectState.traceId,
+      // The real portal returns a data-URI PNG; the bridge must not care which.
+      qrString: 'data:image/png;base64,MOCKQR',
+      merchantId: 'Terminal1',
+      username: 'creditor',
+      apiToken: 'ws-scoped-token',
+      webSocketUrl: 'https://ws.example.test',
+      openWebSocket: true,
+    });
+  }
+
   if (path === '/backend/api/report/transaction/list') {
     if (!auth.startsWith('Bearer ')) return fail(401, '001', 'missing bearer token');
-    return ok({ result: [{ instructionId: 'NQR-MOCK', amount: 635 }], pageable: { currentPage: 1 } });
+    const result = [{ instructionId: 'NQR-MOCK', amount: 635 }];
+    if (collectState.paid && collectState.traceId) {
+      // A Nepal-local wall-clock stamp, exactly as the portal emits it (no
+      // offset), so this also proves the bridge reads it in Nepal time.
+      const nepalNow = new Date(Date.now() + 345 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
+      result.unshift({
+        instructionId: 'NQR-PAID',
+        amount: collectState.paidAmount,
+        validationTraceId: collectState.traceId,
+        localTransactionDateTime: nepalNow,
+        payerName: 'TEST PAYER',
+      });
+    }
+    return ok({ result, pageable: { currentPage: 1 } });
+  }
+
+  if (path === '/backend/api/dashboard/transaction/list') {
+    if (!auth.startsWith('Bearer ')) return fail(401, '001', 'missing bearer token');
+    return ok([]);
+  }
+
+  if (path === '/backend/api/bank/list') {
+    if (!auth.startsWith('Bearer ')) return fail(401, '001', 'missing bearer token');
+    return ok([{ bankName: 'MOCK BANK', bankCode: 'MB001' }]);
   }
 
   return fail(404, '404', `no mock route for ${path}`);
 });
+
+/** Steers the mock above: which trace id a QR got, and whether it has been paid. */
+const collectState = { counter: 0, traceId: '', paid: false, paidAmount: 0 };
 
 const tokenChains = {};
 
@@ -145,6 +188,28 @@ const upstream = `http://127.0.0.1:${port}`;
 /* Load the real Worker                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The Worker memoizes reference routes through the Cache API, which Node does
+ * not have. Install one that answers only `ref/` keys: renewal and collect keys
+ * deliberately miss, so those flows keep the exact behaviour (a null cache)
+ * their existing assertions were written against.
+ */
+const refStore = new Map();
+globalThis.caches = {
+  default: {
+    match: async (request) => {
+      const entry = refStore.get(new URL(request.url).pathname);
+      return entry === undefined
+        ? undefined
+        : new Response(entry, { headers: { 'Content-Type': 'application/json' } });
+    },
+    put: async (request, response) => {
+      const key = new URL(request.url).pathname;
+      if (key.startsWith('/ref/')) refStore.set(key, await response.text());
+    },
+  },
+};
+
 const outDir = mkdtempSync(join(tmpdir(), 'nepalpay-e2e-'));
 await build({
   entryPoints: ['src/nepalpay/index.ts'],
@@ -155,6 +220,20 @@ await build({
   logLevel: 'error',
 });
 const worker = (await import(pathToFileURL(join(outDir, 'worker.mjs')).href)).default;
+
+/** Bundle a second module so tests can mint tokens the Worker must accept. */
+async function bundleModule(entry, name) {
+  const outfile = join(outDir, name);
+  await build({
+    entryPoints: [entry],
+    outfile,
+    bundle: true,
+    format: 'esm',
+    platform: 'neutral',
+    logLevel: 'error',
+  });
+  return import(pathToFileURL(outfile).href);
+}
 
 const baseEnv = {
   SESSION_SECRET: randomBytes(32).toString('base64url'),
@@ -334,6 +413,178 @@ check(
   'edge rejection carries an actionable message',
   /F5 ASM/.test(blockedLogin.body.message ?? ''),
 );
+
+/* ------------------------------------------------------------------ */
+/* 9. Collect — mint a QR, then wait for the payment                    */
+/* ------------------------------------------------------------------ */
+
+const collectLogin = await login('admin_collect');
+check('collect session logs in', collectLogin.status === 200);
+
+const collectRes = await post('/api/collect', collectLogin.session, { amount: 120.5 });
+const collectBody = await collectRes.json();
+const collectData = collectBody.data ?? {};
+// The QR just minted owns this trace id; later collects in this file bump the
+// counter, so remember it before those run.
+const collectTrace = collectState.traceId;
+
+check('a collect mints a QR', collectRes.status === 200 && String(collectData.qrString).startsWith('data:image/png'), collectBody.code);
+check('a collect gets a readable id', /^NP-\d{8}-[0-9A-F]{6}$/.test(collectData.collectId ?? ''), collectData.collectId);
+check('a collect records the trace id it will match on', collectData.keys?.validationTraceId === collectState.traceId, collectData.keys?.validationTraceId);
+check('a collect hands back a status path', String(collectData.statusPath ?? '').startsWith('/api/collect/'), collectData.statusPath);
+check('a collect passes through the live socket it could use', collectData.realtime?.webSocketUrl === 'https://ws.example.test');
+check('a collect reports the amount it was minted for', collectData.amount === 120.5);
+
+const collectRequest = upstreamCalls.filter((c) => c.path === '/backend/api/nqr/generate').at(-1);
+check('the QR request carries the merchant code', collectRequest?.body.merchantCode === 'MERCHANT0001');
+check('the QR request carries the identity block', collectRequest?.body.userDetail?.user === 'admin_collect');
+check('a caller cannot choose another merchant for a collect',
+  (await post('/api/collect', collectLogin.session, { amount: 5, merchantCode: '9999EVIL' })).status === 200 &&
+    upstreamCalls.filter((c) => c.path === '/backend/api/nqr/generate').at(-1)?.body.merchantCode === 'MERCHANT0001');
+
+const statusPath = collectData.statusPath;
+const pendingRes = await call(statusPath, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+const pendingBody = await pendingRes.json();
+check('an unpaid collect reports PENDING', pendingRes.status === 200 && pendingBody.data?.state === 'PENDING', pendingBody.data?.state);
+check('a pending collect says when to ask again', pendingBody.data?.retryAfterMs > 0);
+check('a pending collect carries no transaction', pendingBody.data?.transaction === null);
+
+// Pay the *first* collect: point the mock back at its trace id.
+collectState.traceId = collectTrace;
+collectState.paid = true;
+collectState.paidAmount = 120.5;
+const paidRes = await call(statusPath, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+const paidBody = await paidRes.json();
+check('a paid collect reports PAID', paidBody.data?.state === 'PAID', paidBody.data?.state);
+check('a paid collect returns the matching transaction', paidBody.data?.transaction?.instructionId === 'NQR-PAID');
+check('a paid collect says which key matched', paidBody.data?.matchedBy === 'validationTraceId', paidBody.data?.matchedBy);
+check('a paid collect reports the payer', paidBody.data?.transaction?.payerName === 'TEST PAYER');
+collectState.paid = false;
+
+const badAmount = await post('/api/collect', collectLogin.session, { amount: 'free' });
+check('a collect without a usable amount is refused', badAmount.status === 400 && (await badAmount.json()).code === 'INVALID_REQUEST');
+
+const tampered = await call(`${statusPath}XY`, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+check('a tampered collect id is refused', tampered.status === 401 && (await tampered.json()).code === 'INVALID_COLLECT');
+
+const anonymous = await call(statusPath);
+check('a collect status needs a session', anonymous.status === 401, String(anonymous.status));
+
+const collectModule = await bundleModule('src/shared/collect.ts', 'shared-collect.mjs');
+const ticketBase = {
+  v: 1,
+  provider: 'nepalpay',
+  collectId: 'NP-20260924-FFFFFF',
+  amount: 10,
+  remarks: 'Bridge collect NP-20260924-FFFFFF',
+  orderId: 'NP-20260924-FFFFFF',
+  keys: { validationTraceId: 'TRACE-STALE' },
+  createdAt: Date.now() - 600_000,
+  expiresAt: Date.now() - 60_000,
+};
+const expiredTicket = await collectModule.sealTicket(ticketBase, baseEnv.SESSION_SECRET);
+const expiredRes = await call(`/api/collect/${expiredTicket}`, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+check('an expired collect reports EXPIRED', (await expiredRes.json()).data?.state === 'EXPIRED');
+
+const fpTicket = await collectModule.sealTicket(
+  { ...ticketBase, provider: 'fonepay', keys: { remarks: 'x' } },
+  baseEnv.SESSION_SECRET,
+);
+const wrongBridge = await call(`/api/collect/${fpTicket}`, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+check(
+  'a Fonepay collect id is refused by the NepalPay bridge',
+  wrongBridge.status === 400 && (await wrongBridge.json()).code === 'WRONG_PROVIDER',
+);
+
+/* ------------------------------------------------------------------ */
+/* 10. Parallel requests renew once, not once each                     */
+/* ------------------------------------------------------------------ */
+
+const parallel = await login('admin_due');
+const beforeParallel = upstreamCalls.filter((c) => c.path === '/backend/api/auth/refresh').length;
+await Promise.all(
+  [1, 2, 3, 4, 5].map(() => post('/api/reports/transactions', parallel.session, { fromDate: '2026-09-01' })),
+);
+const afterParallel = upstreamCalls.filter((c) => c.path === '/backend/api/auth/refresh').length;
+check(
+  'five parallel near-expiry calls trigger a single renewal',
+  afterParallel - beforeParallel === 1,
+  String(afterParallel - beforeParallel),
+);
+
+/* ------------------------------------------------------------------ */
+/* 11. Reference routes are answered from a merchant-scoped cache      */
+/* ------------------------------------------------------------------ */
+
+const bankCalls = () => upstreamCalls.filter((c) => c.path === '/backend/api/bank/list').length;
+const banksBefore = bankCalls();
+
+const bankFirst = await post('/api/banks', fresh.session, {});
+const bankFirstBody = await bankFirst.json();
+const bankFirstHeader = bankFirst.headers.get('X-Bridge-Cache');
+
+const bankSecond = await post('/api/banks', fresh.session, {});
+const bankSecondBody = await bankSecond.json();
+const bankSecondHeader = bankSecond.headers.get('X-Bridge-Cache');
+
+check(
+  'a reference route reaches upstream on a cold cache',
+  bankFirst.status === 200 && bankCalls() === banksBefore + 1,
+  String(bankCalls() - banksBefore),
+);
+check('the cold call carries no cache header', bankFirstHeader === null, String(bankFirstHeader));
+check(
+  'the repeat call is served from cache',
+  bankSecond.status === 200 && bankSecondHeader === 'HIT',
+  String(bankSecondHeader),
+);
+check(
+  'the cached answer skips upstream entirely',
+  bankCalls() === banksBefore + 1,
+  String(bankCalls() - banksBefore),
+);
+check(
+  'the cached answer is the upstream payload',
+  bankSecondBody.data?.[0]?.bankCode === 'MB001' &&
+    JSON.stringify(bankSecondBody) === JSON.stringify(bankFirstBody),
+);
+
+/* ------------------------------------------------------------------ */
+/* 11. The bridge key closes the door when configured                  */
+/* ------------------------------------------------------------------ */
+
+const keyedEnv = { ...envWithRenewal, BRIDGE_KEY: 'bridge-secret' };
+const healthWithKey = (headers) =>
+  worker.fetch(new Request('http://worker.local/api/health', { headers }), keyedEnv, {});
+
+const unkeyed = await healthWithKey({});
+check('a closed bridge refuses an unkeyed call', unkeyed.status === 401 && (await unkeyed.json()).code === 'BRIDGE_KEY_REQUIRED');
+
+const wrongKey = await healthWithKey({ 'X-Bridge-Key': 'not-the-secret' });
+check('a closed bridge refuses the wrong key', wrongKey.status === 401 && (await wrongKey.json()).code === 'BRIDGE_KEY_INVALID');
+
+const rightKey = await healthWithKey({ 'X-Bridge-Key': 'bridge-secret' });
+check('a closed bridge admits the right key', rightKey.status === 200 && (await rightKey.json()).status === 'SUCCESS');
+
+const keyedLogin = await worker.fetch(
+  new Request('http://worker.local/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Key': 'bridge-secret' },
+    body: JSON.stringify({ username: 'admin_keyed', password: 'pw' }),
+  }),
+  keyedEnv,
+  {},
+);
+const keyedLoginBody = await keyedLogin.json();
+check('a closed bridge signs in a keyed caller', keyedLogin.status === 200 && keyedLoginBody.status === 'SUCCESS');
+
+const keyedHealth = await healthWithKey({ 'X-Bridge-Key': 'bridge-secret' });
+const keyedHealthBody = await keyedHealth.json();
+check('health reports that the bridge is closed', keyedHealthBody.data?.secure?.bridgeKeyRequired === true);
+check('health reports the edge limiter binding', 'edgeRateLimiterBound' in (keyedHealthBody.data?.secure ?? {}));
+
+const openHealth = await call('/api/health');
+check('health reports an open bridge as open', (await openHealth.json()).data?.secure?.bridgeKeyRequired === false);
 
 // Close keep-alive sockets before the server so Node tears down without tripping
 // the libuv handle assertion on Windows.

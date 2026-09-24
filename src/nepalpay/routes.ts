@@ -28,6 +28,13 @@ export interface RouteSpec {
   defaults?: Record<string, unknown>;
   /** One-line description, surfaced by `GET /api` and in the test console. */
   title?: string;
+  /**
+   * When set, a successful response is reused for this many seconds instead of
+   * re-calling upstream. Keyed by merchant scope plus the built request, so
+   * callers of one merchant share the answer and no other merchant can see it.
+   * For reference lists only — never for anything that changes minute to minute.
+   */
+  cacheSeconds?: number;
 }
 
 /**
@@ -163,6 +170,7 @@ export const POST_ROUTES: RouteSpec[] = [
     upstream: '/backend/api/refund/reason',
     method: 'GET',
     identity: 'none',
+    cacheSeconds: 900,
     title: 'Reference: refund reason codes',
   },
 
@@ -178,12 +186,14 @@ export const POST_ROUTES: RouteSpec[] = [
     upstream: '/backend/api/v1/users/role',
     method: 'GET',
     identity: 'none',
+    cacheSeconds: 900,
     title: 'Reference: assignable roles',
   },
   {
     path: '/banks',
     upstream: '/backend/api/bank/list',
     identity: 'none',
+    cacheSeconds: 900,
     title: 'Reference: acquirer banks',
   },
 ];

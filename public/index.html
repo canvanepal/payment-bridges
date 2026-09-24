@@ -519,6 +519,10 @@
       <label for="p">Password</label>
       <input id="p" type="password" autocomplete="current-password" placeholder="••••••••" />
     </div>
+    <details class="field" style="margin-bottom:14px">
+      <summary style="cursor:pointer;color:var(--muted);font-size:12px">Bridge key (only if the Worker sets BRIDGE_KEY)</summary>
+      <input id="bk" type="password" autocomplete="off" placeholder="X-Bridge-Key value" style="margin-top:8px" />
+    </details>
     <div class="btnrow">
       <button class="primary" type="submit" id="loginBtn">Sign in</button>
       <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
@@ -573,8 +577,11 @@
 /* ==================================================================== */
 
 const SKEY = 'npb.session';
+const BKEY = 'npb.bridgeKey';
 const state = {
   session: '',
+  /** Shared secret for a bridge that sets BRIDGE_KEY. Empty means "open bridge". */
+  bridgeKey: restoreBridgeKey(),
   identity: null,
   view: 'dashboard',
   health: null,
@@ -602,6 +609,8 @@ const daysAgo = (n) => isoDate(new Date(Date.now() - n * 864e5));
 async function api(path, { method = 'POST', body, auth = true } = {}) {
   const init = { method, headers: {} };
   if (auth && state.session) init.headers.Authorization = 'Bearer ' + state.session;
+  // A closed bridge needs this on every call, not just sign-in.
+  if (state.bridgeKey) init.headers['X-Bridge-Key'] = state.bridgeKey;
   if (body !== undefined && method !== 'GET') {
     init.headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(body);
@@ -665,6 +674,10 @@ const EXPLAIN = {
   UPSTREAM_UNREACHABLE: 'The Worker could not open a connection to NepalPay.',
   REFRESH_NOT_CONFIGURED: 'Renewal is off — set NEPALPAY_REFRESH_PATH.',
   REFRESH_FAILED: 'The refresh token was rejected; sign in again.',
+  BRIDGE_KEY_REQUIRED: 'This bridge is closed: set BRIDGE_KEY on the Worker and enter it above.',
+  BRIDGE_KEY_INVALID: 'The bridge key does not match the Worker.',
+  INVALID_COLLECT: 'That collect handle is stale or was tampered with.',
+  WRONG_PROVIDER: 'That collect belongs to the other bridge.',
 };
 
 /* ==================================================================== */
@@ -685,6 +698,19 @@ function restoreSession() {
   try { return localStorage.getItem(SKEY) || sessionStorage.getItem(SKEY) || ''; } catch (_) { return ''; }
 }
 
+/** The bridge key is not a session — it identifies the caller, so it can persist. */
+function restoreBridgeKey() {
+  try { return localStorage.getItem(BKEY) || ''; } catch (_) { return ''; }
+}
+
+function setBridgeKey(value) {
+  state.bridgeKey = value || '';
+  try {
+    if (value) localStorage.setItem(BKEY, value);
+    else localStorage.removeItem(BKEY);
+  } catch (_) { /* private mode: keep in memory */ }
+}
+
 function countdown(at) {
   const ms = at - Date.now();
   if (ms <= 0) return 'expired';
@@ -697,6 +723,7 @@ async function doLogin(event) {
   const username = $('u').value.trim(), password = $('p').value;
   const btn = $('loginBtn'), msg = $('loginMsg');
   if (!username || !password) return showLoginError('Enter a username and password.');
+  if ($('bk') && $('bk').value.trim()) setBridgeKey($('bk').value.trim());
   btn.disabled = true; btn.textContent = 'Signing in…'; msg.classList.add('hidden');
 
   const r = await api('/api/auth/login', { method: 'POST', auth: false, body: { username, password } });
@@ -1128,9 +1155,13 @@ function viewQr() {
           field('qrRemarks', 'Remarks', 'text', 'counter sale') +
         '</div>' +
         '<div class="btnrow"><button class="primary" onclick="genDynamicQr()">Generate QR</button>' +
-          '<button onclick="checkPayment()">Check for payment</button></div>' +
-        '<div class="muted" style="margin-top:9px;font-size:12px">Upstream opens a websocket for live payment ' +
-          'confirmation; the bridge cannot proxy that, so use <b>Check for payment</b> to poll recent transactions.</div>' +
+          '<button onclick="collectWatch()">Take payment</button>' +
+          '<button class="ghost" onclick="stopCollect()">Stop</button></div>' +
+        '<div class="muted" style="margin-top:9px;font-size:12px"><b>Take payment</b> mints a tracked QR and ' +
+          'reports the moment it is paid. It is not a guess: the bridge remembers the portal\'s own ' +
+          '<code>validationTraceId</code> for that QR and matches the payment against it, so a different ' +
+          'customer paying the same amount is not mistaken for yours. Upstream also offers a websocket, ' +
+          'but a request-scoped Worker cannot hold it; polling is what the bridge does instead.</div>' +
       '</div><div id="qrDynamicOut">' + emptyHint('Generate a QR to see it here.') + '</div></div>' +
       '<div class="card"><h2>Static QR</h2><div class="pad">' +
         '<div class="filters" style="margin-bottom:12px">' +
@@ -1242,30 +1273,104 @@ async function genDynamicQr() {
     storeLabel: $('qrStore').value, terminal: $('qrTerminal').value,
     amount: Number($('qrAmount').value || 0), remarks: $('qrRemarks').value,
   };
-  const r = await into('qrDynamicOut', '/api/qr', { body });
-  const data = payload(r);
-  if (data?.qrString) {
-    // Remember what already exists, so "check for payment" can spot a new one.
-    const txns = await api('/api/dashboard/transactions', { body: {} });
-    for (const t of (payload(txns) || [])) if (t.instructionId) state.cache.qrIds.add(t.instructionId);
-    state.cache.lastQr = { amount: body.amount, at: Date.now() };
-  }
+  // The raw portal QR: useful for seeing exactly what upstream returns. Use
+  // "Take payment" when the point is to know whether it was paid.
+  await into('qrDynamicOut', '/api/qr', { body });
 }
 
-async function checkPayment() {
+/*
+ * Take payment: mint a tracked QR and watch it until the money lands.
+ *
+ * This replaces an earlier "check for payment" that diffed the recent-transaction
+ * list — that could not tell *this* payment from any other new row, so a second
+ * terminal selling the same amount looked like success. The collect flow carries
+ * the portal's own trace id, which is what actually identifies the payment.
+ */
+let collectTimer = null;
+let collectHandle = null;
+
+function stopCollect() {
+  if (collectTimer) clearInterval(collectTimer);
+  collectTimer = null;
+  collectHandle = null;
+  const bar = $('collectBar');
+  if (bar) bar.className = 'bar', bar.innerHTML = '<span class="pill"><span class="dot"></span>stopped</span>';
+}
+
+async function collectWatch() {
+  stopCollect();
+  if (!needFields([['qrStore', 'store']], 'qrDynamicOut')) return;
+
+  const amount = Number($('qrAmount').value || 0);
+  const body = {
+    storeLabel: $('qrStore').value,
+    terminal: $('qrTerminal').value,
+    amount: amount,
+    remarks: $('qrRemarks').value,
+  };
+
+  const r = await into('qrDynamicOut', '/api/collect', { body: body });
+  const data = payload(r);
+  if (!data || !data.statusPath) return;
+
+  collectHandle = data;
   const el = $('qrDynamicOut');
-  const before = new Set(state.cache.qrIds);
-  el.insertAdjacentHTML('afterbegin', '<div class="bar" id="qrPollBar"><span class="spin"></span><span class="muted">Checking recent transactions…</span></div>');
-  const r = await api('/api/dashboard/transactions', { body: {} });
-  const rows = payload(r) || [];
-  const fresh = (Array.isArray(rows) ? rows : []).filter((t) => t.instructionId && !before.has(t.instructionId));
-  const bar = $('qrPollBar');
-  if (bar) {
+  const realtime = data.realtime && data.realtime.webSocketUrl;
+
+  el.innerHTML =
+    '<div class="pad">' +
+      '<div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">' +
+        '<div style="background:#fff;padding:10px;border-radius:12px;flex:none">' +
+          '<img alt="Payment QR" src="' + esc(data.qrString) + '" style="width:186px;height:186px;display:block" />' +
+        '</div>' +
+        '<div style="flex:1;min-width:190px">' +
+          '<div class="kv"><span>amount</span><b>NPR ' + money(data.amount) + '</b></div>' +
+          '<div class="kv"><span>collect</span><b>' + esc(data.collectId) + '</b></div>' +
+          '<div class="kv"><span>expires</span><b id="collectExpiry">' + esc(countdown(data.expiresAt)) + '</b></div>' +
+          '<div class="kv"><span>trace</span><b>' + esc(data.keys?.validationTraceId || '—') + '</b></div>' +
+          '<div class="kv"><span>live socket</span><b>' + (realtime ? esc(realtime) : 'not offered') + '</b></div>' +
+          '<div class="muted" style="font-size:11.5px;margin-top:8px">A customer can scan this while you watch; ' +
+            'the status below updates by itself.</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="bar" id="collectBar" style="margin-top:12px"><span class="spin"></span>' +
+        '<span class="muted">Waiting for a payment…</span></div>' +
+      '<details class="raw"><summary>Collect envelope</summary><pre class="json">' +
+        esc(JSON.stringify(r.json, null, 2)) + '</pre></details>' +
+    '</div>';
+
+  const poll = async () => {
+    if (!collectHandle) return;
+    const status = await api(data.statusPath, { method: 'GET' });
+    const d = payload(status);
+    const bar = $('collectBar');
+    if (!bar || !d) return;
+
+    if (d.state === 'PAID') {
+      stopCollect();
+      bar.className = 'bar';
+      bar.innerHTML = '<span class="pill ok"><span class="dot"></span>paid ' + money(d.transaction?.amount ?? data.amount) +
+        ' · ' + esc(d.transaction?.payerName || 'customer') + ' · matched by ' + esc(d.matchedBy || '—') + '</span>';
+      loadHealth();
+      return;
+    }
+
+    if (d.state === 'EXPIRED') {
+      stopCollect();
+      bar.className = 'bar';
+      bar.innerHTML = '<span class="pill warn"><span class="dot"></span>expired unpaid — mint a new QR</span>';
+      return;
+    }
+
     bar.className = 'bar';
-    bar.innerHTML = fresh.length
-      ? '<span class="pill ok"><span class="dot"></span>new payment: ' + esc(fresh[0].instructionId) + ' · ' + money(fresh[0].amount) + '</span>'
-      : '<span class="pill warn"><span class="dot"></span>no new payment yet (' + esc((Array.isArray(rows) ? rows.length : 0)) + ' recent rows checked)</span>';
-  }
+    bar.innerHTML = '<span class="spin"></span><span class="muted">' +
+      (d.upstreamError ? 'could not read transactions just now — still trying' : 'no payment yet') +
+      ' · checked ' + new Date().toLocaleTimeString() + '</span>';
+  };
+
+  const every = Number(data.retryAfterMs || 3000);
+  collectTimer = setInterval(poll, Math.max(1500, every));
+  poll();
 }
 
 async function genStoreQr() {
@@ -1693,6 +1798,9 @@ function selectField(id, label) {
 (async function boot() {
   $('loginForm').addEventListener('submit', doLogin);
   state.session = restoreSession();
+  // Restored, not just held in memory, so a reload does not lock you out of a
+  // bridge that requires a key.
+  if (state.bridgeKey && $('bk')) $('bk').value = state.bridgeKey;
 
   if (state.session) {
     $('login').classList.add('hidden');

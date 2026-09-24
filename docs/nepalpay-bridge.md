@@ -392,8 +392,8 @@ cp .dev.vars.example .dev.vars   # then edit it
 
 # 4. Run
 npm run dev      # http://127.0.0.1:8787
-npm test         # 85 unit checks, no network
-npm run test:e2e # 32 checks against a local mock upstream
+npm test         # 210 checks (both providers), no network
+npm run test:e2e # 67 checks against a local mock upstream
 npm run typecheck
 npm run deploy
 ```
@@ -588,7 +588,7 @@ public/nepalpay.js       Client SDK (script tag / global)
 public/nepalpay.mjs      Client SDK ESM entry point
 public/pay.html          Embeddable "scan to pay" QR page
 public/favicon.svg       Brand mark
-test/run.mjs             85 unit checks, no network
-test/e2e.mjs             32 checks: full flow against a mock upstream
+test/run.mjs             unit suite for both providers, no network
+test/e2e.mjs             67 checks: full flow against a mock upstream
 tools/find-refresh.mjs   Locates the refresh call in a captured HAR
 ```

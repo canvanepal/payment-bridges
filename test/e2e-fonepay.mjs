@@ -30,6 +30,9 @@ const state = {
   counter: 0,
   currentToken: null,
   calls: [],
+  /** When set, the collection report contains a payment carrying these remarks. */
+  paidRemarks: '',
+  paidAmount: 0,
 };
 
 const issueToken = (label) => {
@@ -180,6 +183,35 @@ const server = createServer(async (req, res) => {
 
   if (path.endsWith('/collections/transactions/filtered')) {
     if (!requireToken()) return;
+    const content = [
+      {
+        id: '1298700937',
+        transactionId: '1301399122',
+        merchantId: 210001,
+        merchantNickname: 'Example Farm',
+        amount: 200,
+        paymentStatus: 'Success',
+        settlementStatus: 'PENDING',
+        localTransactionDate: '2026-09-23 21:29:03',
+      },
+    ];
+    if (state.paidRemarks) {
+      // A Nepal-local wall-clock stamp, as the gateway reports it (no offset).
+      const localNow = new Date(Date.now() + 345 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
+      content.unshift({
+        id: '1',
+        transactionId: '999',
+        merchantId: 210001,
+        merchantNickname: 'Example Farm',
+        amount: state.paidAmount,
+        netAmount: state.paidAmount,
+        paymentStatus: 'Success',
+        settlementStatus: 'PENDING',
+        remarks: state.paidRemarks,
+        remarks1: state.paidRemarks,
+        localTransactionDate: localNow,
+      });
+    }
     return send(202, envelope({
       totalAmount: 200,
       pageNumber: 0,
@@ -187,18 +219,7 @@ const server = createServer(async (req, res) => {
       totalPages: 2,
       netAmount: 200,
       charge: 0,
-      content: [
-        {
-          id: '1298700937',
-          transactionId: '1301399122',
-          merchantId: 210001,
-          merchantNickname: 'Example Farm',
-          amount: 200,
-          paymentStatus: 'Success',
-          settlementStatus: 'PENDING',
-          localTransactionDate: '2026-09-23 21:29:03',
-        },
-      ],
+      content,
     }, 'Transactions retrieved'));
   }
 
@@ -210,10 +231,18 @@ const server = createServer(async (req, res) => {
       terminalId: 214001,
       qrMessage: '00020101021226570011fonepay.com',
       amount: body.amount,
+      orderId: body.orderId,
+      referenceId: `REF-${body.orderId ?? 'MOCK'}`,
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
       websocketId: 'wss://ws.fonepay.com/merchantEndPoint/mock',
       terminalName: 'Example Farm',
       remarks: body.remarks,
     }, 'Dynamic QR code generated'));
+  }
+
+  if (path.endsWith('/collections/transactions/my-hierarchy')) {
+    if (!requireToken()) return;
+    return send(202, envelope({ branches: ['Head Office'] }, 'Hierarchy retrieved'));
   }
 
   if (path.endsWith('/profile/fetch-user-profile-details')) {
@@ -232,6 +261,28 @@ const upstream = `http://127.0.0.1:${port}`;
 /* Load the real Worker                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The Worker memoizes reference routes through the Cache API, which Node does
+ * not have. Install one that answers only `ref/` keys: renewal and collect keys
+ * deliberately miss, so those flows keep the exact behaviour (a null cache)
+ * their existing assertions were written against.
+ */
+const refStore = new Map();
+globalThis.caches = {
+  default: {
+    match: async (request) => {
+      const entry = refStore.get(new URL(request.url).pathname);
+      return entry === undefined
+        ? undefined
+        : new Response(entry, { headers: { 'Content-Type': 'application/json' } });
+    },
+    put: async (request, response) => {
+      const key = new URL(request.url).pathname;
+      if (key.startsWith('/ref/')) refStore.set(key, await response.text());
+    },
+  },
+};
+
 const outDir = mkdtempSync(join(tmpdir(), 'fonepay-e2e-'));
 await build({
   entryPoints: ['src/fonepay/index.ts'],
@@ -242,6 +293,20 @@ await build({
   logLevel: 'error',
 });
 const worker = (await import(pathToFileURL(join(outDir, 'worker.mjs')).href)).default;
+
+/** Bundle a second module so tests can mint tokens the Worker must accept. */
+async function bundleModule(entry, name) {
+  const outfile = join(outDir, name);
+  await build({
+    entryPoints: [entry],
+    outfile,
+    bundle: true,
+    format: 'esm',
+    platform: 'neutral',
+    logLevel: 'error',
+  });
+  return import(pathToFileURL(outfile).href);
+}
 
 const baseEnv = {
   SESSION_SECRET: randomBytes(32).toString('base64url'),
@@ -298,6 +363,36 @@ check('sign-in never spoofs a browser UA', !/Mozilla|Chrome|Firefox/i.test(login
 
 const lookupCall = state.calls.find((entry) => entry.path.endsWith('email-lookup'));
 check('lookup sent only the identifier', Object.keys(lookupCall?.body ?? {}).sort().join(',') === 'clientCode,emailOrUsername');
+
+/* ------------------------------------------------------------------ */
+/* 1b. Reference routes are answered from an account-scoped cache      */
+/* ------------------------------------------------------------------ */
+
+const hierCalls = () => countPath('/collections/transactions/my-hierarchy');
+const hierBefore = hierCalls();
+
+const hierHeaders = { Authorization: `Bearer ${fresh.session}` };
+const hierFirst = await call('/api/transactions/hierarchy', { headers: hierHeaders });
+const hierFirstHeader = hierFirst.headers.get('X-Bridge-Cache');
+const hierSecond = await call('/api/transactions/hierarchy', { headers: hierHeaders });
+const hierSecondHeader = hierSecond.headers.get('X-Bridge-Cache');
+
+check(
+  'the filter tree reaches the gateway on a cold cache',
+  hierFirst.status === 202 && hierCalls() === hierBefore + 1,
+  `${hierFirst.status} ${hierCalls() - hierBefore}`,
+);
+check('the cold call carries no cache header', hierFirstHeader === null, String(hierFirstHeader));
+check(
+  'the repeat call is served from cache',
+  hierSecond.status === 202 && hierSecondHeader === 'HIT',
+  `${hierSecond.status} ${hierSecondHeader}`,
+);
+check(
+  'the cached answer skips the gateway entirely',
+  hierCalls() === hierBefore + 1,
+  String(hierCalls() - hierBefore),
+);
 
 /* ------------------------------------------------------------------ */
 /* 2. Rejections stay opaque                                           */
@@ -505,12 +600,128 @@ const discoveryBody = await discovery.json();
 check('discovery lists the curated routes', discoveryBody.data?.endpoints?.length >= 14, String(discoveryBody.data?.endpoints?.length));
 check('discovery names the renewal strategy', discoveryBody.data?.renewal?.strategy === 'sign-in-again');
 
+/* ------------------------------------------------------------------ */
+/* Collect — mint a QR, then wait for the payment                      */
+/* ------------------------------------------------------------------ */
+
+const collectLogin = await login('collector@example.com');
+check('collect session signs in', collectLogin.status === 200);
+
+const collectRes = await post('/api/collect', collectLogin.session, { amount: 250 });
+const collectBody = await collectRes.json();
+const collectData = collectBody.data ?? {};
+
+check('a collect mints a QR', collectRes.status === 200 && collectData.qrString === '00020101021226570011fonepay.com', `${collectRes.status} ${collectBody.code}`);
+check('a collect gets a readable id', /^FP-\d{8}-[0-9A-F]{6}$/.test(collectData.collectId ?? ''), collectData.collectId);
+check('a collect writes a unique remark when the caller gives none', /^Bridge collect FP-/.test(collectData.remarks ?? ''), collectData.remarks);
+check('a collect reuses its id as the order id', collectData.orderId === collectData.collectId);
+check('a collect hands back a status path', String(collectData.statusPath ?? '').startsWith('/api/collect/'), collectData.statusPath);
+check('a collect records the reference id', String(collectData.keys?.referenceId ?? '').startsWith('REF-'), collectData.keys?.referenceId);
+check('a collect passes the websocket id through', collectData.realtime?.requestId === 'wss://ws.fonepay.com/merchantEndPoint/mock');
+
+const qrRequest = state.calls.filter((entry) => entry.path.endsWith('/qr/dynamic')).at(-1);
+check('the QR request carries the collected amount', qrRequest?.body.amount === 250, String(qrRequest?.body.amount));
+check('the QR request carries the generated remarks', qrRequest?.body.remarks === collectData.remarks);
+check('the QR request is scoped to a linked merchant', /linked-merchants\/2000001\/qr\/dynamic$/.test(qrRequest?.path ?? ''), qrRequest?.path);
+
+const statusPath = collectData.statusPath;
+const pendingRes = await call(statusPath, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+const pendingBody = await pendingRes.json();
+check('an unpaid collect reports PENDING', pendingRes.status === 200 && pendingBody.data?.state === 'PENDING', pendingBody.data?.state);
+check('a pending collect suggests when to ask again', pendingBody.data?.retryAfterMs > 0);
+
+// Pay it: the report now carries a row with our own remarks.
+state.paidRemarks = collectData.remarks;
+state.paidAmount = 250;
+const paidRes = await call(statusPath, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+const paidBody = await paidRes.json();
+check('a paid collect reports PAID', paidBody.data?.state === 'PAID', paidBody.data?.state);
+check('a paid collect says which field matched', paidBody.data?.matchedBy === 'remarks', paidBody.data?.matchedBy);
+check('a paid collect returns the transaction', paidBody.data?.transaction?.transactionId === '999');
+
+const badAmount = await post('/api/collect', collectLogin.session, { amount: 0 });
+check('a collect without a usable amount is refused', badAmount.status === 400 && (await badAmount.json()).code === 'INVALID_REQUEST');
+
+state.paidRemarks = '';
+
+const tampered = await call(`${statusPath}ZZ`, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+check('a tampered collect id is refused', tampered.status === 401 && (await tampered.json()).code === 'INVALID_COLLECT');
+
+const anonymous = await call(statusPath);
+check('a collect status needs a session', anonymous.status === 401, String(anonymous.status));
+
+const collectModule = await bundleModule('src/shared/collect.ts', 'shared-collect.mjs');
+const ticketBase = {
+  v: 1,
+  provider: 'fonepay',
+  collectId: 'FP-20260924-FFFFFF',
+  amount: 10,
+  remarks: 'Bridge collect FP-20260924-FFFFFF',
+  orderId: 'FP-20260924-FFFFFF',
+  keys: { remarks: 'x', orderId: 'x' },
+  createdAt: Date.now() - 600_000,
+  expiresAt: Date.now() - 60_000,
+};
+const expiredTicket = await collectModule.sealTicket(ticketBase, baseEnv.SESSION_SECRET);
+const expiredRes = await call(`/api/collect/${expiredTicket}`, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+check('an expired collect reports EXPIRED', (await expiredRes.json()).data?.state === 'EXPIRED');
+
+const npTicket = await collectModule.sealTicket(
+  { ...ticketBase, provider: 'nepalpay', keys: { validationTraceId: 'T' } },
+  baseEnv.SESSION_SECRET,
+);
+const wrongBridge = await call(`/api/collect/${npTicket}`, { headers: { Authorization: `Bearer ${collectLogin.session}` } });
+check(
+  'a NepalPay collect id is refused by the Fonepay bridge',
+  wrongBridge.status === 400 && (await wrongBridge.json()).code === 'WRONG_PROVIDER',
+);
+
+/* ------------------------------------------------------------------ */
+/* Parallel requests re-sign-in once, not once each                    */
+/* ------------------------------------------------------------------ */
+
+// This matters more here than anywhere: renewal posts the stored password, so a
+// burst of concurrent requests must not become a burst of sign-ins.
+const parallel = await login('operator-expired@example.com');
+check('a session that is already expired still signs in', parallel.status === 200);
+
+const burstLoginsBefore = countPath('corporate-login');
+await Promise.all([1, 2, 3, 4, 5].map(() => call('/api/merchants', { headers: { Authorization: `Bearer ${parallel.session}` } })));
+const burstLoginsAfter = countPath('corporate-login');
+check(
+  'five parallel expired calls re-sign-in once',
+  burstLoginsAfter - burstLoginsBefore === 1,
+  String(burstLoginsAfter - burstLoginsBefore),
+);
+
+/* ------------------------------------------------------------------ */
+/* The bridge key closes the door when configured                      */
+/* ------------------------------------------------------------------ */
+
+const keyedEnv = { ...baseEnv, BRIDGE_KEY: 'bridge-secret' };
+const healthWithKey = (headers) =>
+  worker.fetch(new Request('http://worker.local/api/health', { headers }), keyedEnv, {});
+
+const unkeyed = await healthWithKey({});
+check('a closed bridge refuses an unkeyed call', unkeyed.status === 401 && (await unkeyed.json()).code === 'BRIDGE_KEY_REQUIRED');
+
+const wrongKey = await healthWithKey({ 'X-Bridge-Key': 'nope' });
+check('a closed bridge refuses the wrong key', wrongKey.status === 401 && (await wrongKey.json()).code === 'BRIDGE_KEY_INVALID');
+
+const rightKey = await healthWithKey({ 'X-Bridge-Key': 'bridge-secret' });
+check('a closed bridge admits the right key', rightKey.status === 200);
+check('health reports that the bridge is closed', (await rightKey.json()).data?.secure?.bridgeKeyRequired === true);
+check('an open bridge reports itself open', (await (await call('/api/health')).json()).data?.secure?.bridgeKeyRequired === false);
+
 const notFound = await call('/api/nope');
 check('an unknown route 404s', notFound.status === 404);
 
 const preflight = await call('/api/auth/login', { method: 'OPTIONS', headers: { Origin: 'https://site.example' } });
 check('CORS preflight is answered', preflight.status === 204 && preflight.headers.get('Access-Control-Allow-Origin') === '*');
-check('CORS exposes the renewal header', preflight.headers.get('Access-Control-Expose-Headers') === 'X-Session-Token');
+const exposed = preflight.headers.get('Access-Control-Expose-Headers') ?? '';
+const allowed = preflight.headers.get('Access-Control-Allow-Headers') ?? '';
+check('CORS exposes the renewal header', exposed.includes('X-Session-Token'), exposed);
+check('CORS allows the bridge key header', allowed.includes('X-Bridge-Key'), allowed);
 
 // Close keep-alive sockets before the server so Node tears down without tripping
 // the libuv handle assertion on Windows.

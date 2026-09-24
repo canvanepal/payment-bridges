@@ -4,9 +4,15 @@ import { createMiddleware } from 'hono/factory';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { bearerFrom, corsMiddleware, readJsonBody, SESSION_HEADER } from '../shared/cors';
 import { errorBody, secretMissing, successBody } from '../shared/errors';
-import { isRateLimited } from '../shared/ratelimit';
+import { checkRateLimit } from '../shared/ratelimit';
 import { openSession, sealSession } from '../shared/session';
 import { parseHeaderMode } from '../shared/headers';
+import { defaultCache } from '../shared/kvcache';
+import { REF_CACHE_HEADER, withRefCache } from '../shared/refcache';
+import { renewOnce } from '../shared/renewal';
+import { BRIDGE_KEY_HEADER, bridgeKeyOf, requireBridgeKey } from '../shared/bridge-key';
+import { COLLECT_RETRY_AFTER_MS, openTicket, sealTicket } from '../shared/collect';
+import { collectStatus, startCollect } from './collect';
 import { runProbeMatrix } from './diag';
 import { callUpstream, decodeJwtPayload, normalizeBaseUrl, str, strArray } from './client';
 import {
@@ -52,22 +58,33 @@ async function renewSession(
   const path = refreshPath(env);
   if (!path) return null;
 
-  const outcome = await performRefresh({
-    baseUrl,
-    path,
-    styles: parseRefreshStyles(env.NEPALPAY_REFRESH_STYLE),
-    refreshToken: session.refreshToken,
-    cookies: session.cookies,
-    headerMode,
+  // Deduplicate by the token being renewed, so twenty requests that notice the
+  // same near-expiry token at once perform one refresh between them rather than
+  // twenty. A cache hit reports `style: "shared"` because no refresh ran here.
+  let style = 'shared';
+  const sealed = await renewOnce({
+    sessionToken: session.accessToken,
+    cache: defaultCache(),
+    renew: async () => {
+      const outcome = await performRefresh({
+        baseUrl,
+        path,
+        styles: parseRefreshStyles(env.NEPALPAY_REFRESH_STYLE),
+        refreshToken: session.refreshToken,
+        cookies: session.cookies,
+        headerMode,
+      });
+      if (!outcome) return null;
+      style = outcome.style;
+      return sealSession(applyRefresh(session, outcome), env.SESSION_SECRET);
+    },
   });
-  if (!outcome) return null;
 
-  const renewed = applyRefresh(session, outcome);
-  return {
-    session: renewed,
-    sealed: await sealSession(renewed, env.SESSION_SECRET),
-    style: outcome.style,
-  };
+  if (!sealed) return null;
+
+  const renewed = await openSession<SessionPayload>(sealed, env.SESSION_SECRET);
+  if (!renewed) return null;
+  return { session: renewed, sealed, style };
 }
 
 /* ------------------------------------------------------------------ */
@@ -79,8 +96,14 @@ app.use(
   corsMiddleware({
     sessionHeader: SESSION_HEADER,
     allowOrigins: (env) => env.ALLOWED_ORIGINS as string | undefined,
+    extraHeaders: [BRIDGE_KEY_HEADER],
   }),
 );
+
+// Manned door. Does nothing until BRIDGE_KEY is set, then every /api/* call
+// needs the shared secret — without it the bridge is a credential relay that
+// anyone who finds the URL can drive.
+app.use('/api/*', requireBridgeKey());
 
 /** Validate the session token and make it available. Rejects expired-or-worse tokens. */
 const loadSession = createMiddleware<AppEnv>(async (c, next) => {
@@ -171,7 +194,7 @@ app.post('/api/auth/login', async (c) => {
 
   const ip = c.req.header('CF-Connecting-IP') ?? 'unknown';
   const limit = Number(c.env.LOGIN_RATE_LIMIT_PER_MINUTE ?? '') || 10;
-  if (isRateLimited(ip, limit)) {
+  if (await checkRateLimit(c.env, ip, limit)) {
     return c.json(
       errorBody('RATE_LIMITED', 'Too many sign-in attempts. Try again in a minute.'),
       429,
@@ -364,6 +387,101 @@ app.post('/api/auth/logout', (c) =>
 );
 
 /* ------------------------------------------------------------------ */
+/* Collect — take a payment and learn when it lands                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Mint a dynamic QR for an amount and return a ticket to watch it with.
+ *
+ * The QR is per-payment, so it is minted here rather than reusing the generic
+ * `/api/qr` route: this also captures the correlation values the status call
+ * needs, which the plain route would throw away.
+ */
+app.post('/api/collect', requireSession, async (c) => {
+  const outcome = await startCollect({
+    env: c.env,
+    session: c.get('session'),
+    input: await readJsonBody(c),
+  });
+
+  if (!outcome.ok) return c.json(errorBody(outcome.code, outcome.message), outcome.status as ContentfulStatusCode);
+
+  const { ticket } = outcome;
+  const sealed = await sealTicket(ticket, c.env.SESSION_SECRET);
+
+  return c.json(
+    successBody('QR created. Poll statusPath until it reports PAID.', {
+      collectId: ticket.collectId,
+      amount: ticket.amount,
+      remarks: ticket.remarks,
+      orderId: ticket.orderId,
+      qrString: outcome.qrString,
+      expiresAt: ticket.expiresAt,
+      ttlSeconds: Math.round((ticket.expiresAt - ticket.createdAt) / 1000),
+      statusPath: `/api/collect/${sealed}`,
+      retryAfterMs: COLLECT_RETRY_AFTER_MS,
+      keys: ticket.keys,
+      realtime: ticket.realtime ?? null,
+      upstream: {
+        validationTraceId: ticket.keys.validationTraceId,
+        openWebSocket: outcome.qr.openWebSocket ?? null,
+      },
+    }),
+  );
+});
+
+/**
+ * Poll a collect. Answers PENDING while nothing has arrived, PAID once a
+ * transaction matches, and EXPIRED after the ticket's own lifetime.
+ *
+ * The verdict is cached for a couple of seconds so several watchers of one QR do
+ * not each trigger their own scan of the merchant's transactions.
+ */
+app.get('/api/collect/:id', requireSession, async (c) => {
+  const ticket = await openTicket(c.req.param('id'), c.env.SESSION_SECRET);
+  if (!ticket) {
+    return c.json(
+      errorBody('INVALID_COLLECT', 'This collect id is invalid or was tampered with.'),
+      401,
+    );
+  }
+
+  if (ticket.provider !== 'nepalpay') {
+    return c.json(
+      errorBody('WRONG_PROVIDER', 'This collect id belongs to the Fonepay bridge.'),
+      400,
+    );
+  }
+
+  const outcome = await collectStatus({
+    env: c.env,
+    session: c.get('session'),
+    ticket,
+  });
+
+  const message =
+    outcome.state === 'PAID'
+      ? 'Payment received.'
+      : outcome.state === 'EXPIRED'
+        ? 'This QR expired.'
+        : 'No payment yet.';
+
+  return c.json(
+    successBody(message, {
+      collectId: ticket.collectId,
+      state: outcome.state,
+      amount: ticket.amount,
+      expiresAt: ticket.expiresAt,
+      retryAfterMs: outcome.state === 'PENDING' ? COLLECT_RETRY_AFTER_MS : null,
+      matchedBy: outcome.matchedBy ?? null,
+      transaction: outcome.transaction ?? null,
+      note: outcome.note ?? null,
+      upstreamError: outcome.upstreamError ?? null,
+    }),
+  );
+});
+
+/* ------------------------------------------------------------------ */
 /* Data routes                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -375,15 +493,27 @@ for (const spec of POST_ROUTES) {
     const incoming = method === 'POST' ? await readJsonBody(c) : {};
     const body = buildPayload(session, incoming, spec);
 
-    const result = await callUpstream({
-      baseUrl: baseUrlOf(c),
-      path: spec.upstream,
-      method,
-      body: method === 'POST' ? body : undefined,
-      accessToken: session.accessToken,
-      cookies: session.cookies,
-      headerMode: parseHeaderMode(c.env.NEPALPAY_HEADER_MODE),
+    // Reference routes (`cacheSeconds`) answer from a merchant-scoped cache;
+    // everything else always goes upstream.
+    const { result, hit } = await withRefCache({
+      cache: defaultCache(),
+      ttlSeconds: spec.cacheSeconds,
+      route: spec.path,
+      scope: session.merchantCode,
+      request: { upstream: spec.upstream, body },
+      cacheable: (r) => !r.blocked && r.status >= 200 && r.status < 300,
+      run: () =>
+        callUpstream({
+          baseUrl: baseUrlOf(c),
+          path: spec.upstream,
+          method,
+          body: method === 'POST' ? body : undefined,
+          accessToken: session.accessToken,
+          cookies: session.cookies,
+          headerMode: parseHeaderMode(c.env.NEPALPAY_HEADER_MODE),
+        }),
     });
+    if (hit) c.header(REF_CACHE_HEADER, 'HIT');
 
     if (result.blocked) return c.json(errorBody('UPSTREAM_BLOCKED', result.envelope.message), 502);
 
@@ -405,8 +535,15 @@ app.get('/api/health', (c) =>
     message: 'ok',
     timeStamp: new Date().toISOString(),
     data: {
+      provider: 'nepalpay',
       upstream: baseUrlOf(c),
       sessionSecretConfigured: Boolean(c.env.SESSION_SECRET),
+      secure: {
+        bridgeKeyRequired: bridgeKeyOf(c.env) !== null,
+        edgeRateLimiterBound: Boolean(c.env.LOGIN_RATE_LIMITER),
+        allowedOrigins: (c.env.ALLOWED_ORIGINS ?? '') || '*',
+        loginRateLimitPerMinute: Number(c.env.LOGIN_RATE_LIMIT_PER_MINUTE ?? '') || 10,
+      },
       autoRenew: refreshPath(c.env) !== null,
       refreshStyles: parseRefreshStyles(c.env.NEPALPAY_REFRESH_STYLE),
       headerMode: parseHeaderMode(c.env.NEPALPAY_HEADER_MODE),
@@ -453,6 +590,14 @@ app.get('/api', (c) =>
         'POST /api/auth/refresh',
         'POST /api/auth/logout',
       ],
+      collect: [
+        'POST /api/collect  { amount, storeLabel?, terminal?, remarks?, expiresInSeconds? }',
+        'GET /api/collect/:id  -> PENDING | PAID | EXPIRED',
+      ],
+      security: {
+        bridgeKeyHeader: BRIDGE_KEY_HEADER,
+        bridgeKeyRequired: bridgeKeyOf(c.env) !== null,
+      },
       endpoints: POST_ROUTES.map((spec) => ({
         route: `${spec.method ?? 'POST'} /api${spec.path}`,
         upstream: spec.upstream,

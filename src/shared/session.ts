@@ -1,9 +1,14 @@
 /**
- * Sealed-session crypto, shared by every provider bridge.
+ * Sealed-token crypto, shared by every provider bridge.
  *
- * A session is encrypted into one opaque, tamper-evident token with AES-GCM,
+ * A payload is encrypted into one opaque, tamper-evident token with AES-GCM,
  * keyed by the Worker's `SESSION_SECRET`. Nothing is stored server-side, so there
  * is no KV eventual-consistency window and no session database to operate.
+ *
+ * Two kinds of payload travel through here: provider *sessions*, which carry an
+ * upstream access token, and *collect tickets*, which describe a payment that is
+ * being waited on. Both need the same seal/unseal guarantees, so the crypto is
+ * generic and the version tag is the only shared requirement.
  */
 
 const encoder = new TextEncoder();
@@ -12,9 +17,13 @@ const decoder = new TextDecoder();
 const IV_LENGTH = 12;
 const KEY_LENGTH = 32;
 
-/** Minimum shape every provider's session must satisfy. */
-export interface SealedSession {
+/** Minimum shape of anything that gets sealed. */
+export interface SealedToken {
   v: 1;
+}
+
+/** Minimum shape every provider's session must satisfy. */
+export interface SealedSession extends SealedToken {
   /** Upstream access token, replayed as `Authorization: Bearer …`. */
   accessToken: string;
 }
@@ -44,15 +53,12 @@ async function importKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-/** Encrypt a session into an opaque token the client can hold. */
-export async function sealSession<T extends SealedSession>(
-  session: T,
-  secret: string,
-): Promise<string> {
+/** Encrypt any versioned payload into an opaque token the client can hold. */
+export async function sealToken<T extends SealedToken>(payload: T, secret: string): Promise<string> {
   const key = await importKey(secret);
   const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
   const ciphertext = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(JSON.stringify(session))),
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(JSON.stringify(payload))),
   );
 
   const combined = new Uint8Array(iv.length + ciphertext.length);
@@ -62,10 +68,14 @@ export async function sealSession<T extends SealedSession>(
   return base64UrlEncode(combined);
 }
 
-/** Decrypt a session token, returning null when it is malformed or fails authentication. */
-export async function openSession<T extends SealedSession>(
+/**
+ * Decrypt a token, returning null when it is malformed, fails authentication, or
+ * does not satisfy the caller's `isValid` check.
+ */
+export async function openToken<T extends SealedToken>(
   token: string,
   secret: string,
+  isValid?: (payload: T) => boolean,
 ): Promise<T | null> {
   try {
     const key = await importKey(secret);
@@ -77,8 +87,23 @@ export async function openSession<T extends SealedSession>(
     const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
 
     const parsed = JSON.parse(decoder.decode(plaintext)) as T;
-    return parsed?.v === 1 && typeof parsed.accessToken === 'string' ? parsed : null;
+    if (parsed?.v !== 1) return null;
+    if (isValid && !isValid(parsed)) return null;
+    return parsed;
   } catch {
     return null;
   }
+}
+
+/** Encrypt a session into an opaque token the client can hold. */
+export function sealSession<T extends SealedSession>(session: T, secret: string): Promise<string> {
+  return sealToken(session, secret);
+}
+
+/** Decrypt a session token, returning null when it is malformed or tampered with. */
+export function openSession<T extends SealedSession>(
+  token: string,
+  secret: string,
+): Promise<T | null> {
+  return openToken<T>(token, secret, (payload) => typeof payload.accessToken === 'string');
 }

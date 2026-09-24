@@ -208,11 +208,13 @@ Deploy with `npm run deploy:fonepay`, develop with `npm run dev:fonepay`.
 ## Verification
 
 `npm run test:e2e:fonepay` drives the real Worker against a local mock gateway —
-**69 checks**, including: sign-in with and without a corporate code, multiple
+**102 checks**, including: sign-in with and without a corporate code, multiple
 corporate accounts, `firstLogin`, the OTP hand-off, opaque auth failures, the
 `202` pass-through, merchant scoping refusal, proactive renewal, recovery from an
 expired token, recovery from a token the *server* invalidated, failing closed when
-renewal is off, the throttle, and the CORS preflight.
+renewal is off, the throttle, the CORS preflight, and the account-scoped cache
+answering a reference route a second time as `X-Bridge-Cache: HIT` with no
+further gateway call.
 
 `npm test` adds unit coverage for `expireTime` interpretation, login-response
 parsing, the linked-merchant shape and the request builder.

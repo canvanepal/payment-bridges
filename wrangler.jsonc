@@ -9,6 +9,16 @@
   "observability": {
     "enabled": true
   },
+  // Edge-wide sign-in throttle. Counts per key across every isolate, which is
+  // what actually stops a distributed attempt; the in-isolate counter in
+  // src/shared/ratelimit.ts only blunts a single-instance burst.
+  "ratelimits": [
+    {
+      "name": "LOGIN_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 10, "period": 60 }
+    }
+  ],
   "vars": {
     "NEPALPAY_BASE_URL": "https://business.nepalpay.com.np",
     "NEPALPAY_REFRESH_PATH": "/backend/api/auth/refresh-token",

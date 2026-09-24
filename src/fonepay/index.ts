@@ -4,8 +4,14 @@ import { createMiddleware } from 'hono/factory';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { bearerFrom, corsMiddleware, readJsonBody, SESSION_HEADER } from '../shared/cors';
 import { errorBody, secretMissing, successBody } from '../shared/errors';
-import { isRateLimited } from '../shared/ratelimit';
+import { checkRateLimit } from '../shared/ratelimit';
 import { openSession, sealSession } from '../shared/session';
+import { defaultCache } from '../shared/kvcache';
+import { REF_CACHE_HEADER, withRefCache } from '../shared/refcache';
+import { renewOnce } from '../shared/renewal';
+import { BRIDGE_KEY_HEADER, bridgeKeyOf, requireBridgeKey } from '../shared/bridge-key';
+import { COLLECT_RETRY_AFTER_MS, openTicket, sealTicket } from '../shared/collect';
+import { collectStatus, startCollect } from './collect';
 import {
   apiBase,
   authBase,
@@ -303,22 +309,39 @@ async function renewSession(
 ): Promise<{ session: FonepaySession; sealed: string } | null> {
   if (!renewEnabled(env)) return null;
 
-  const outcome = await signIn(env, {
-    emailOrUsername: session.credentials.emailOrUsername,
-    password: session.credentials.password,
-    corporateCode: session.corporateCode,
+  // Renewal here is a *real sign-in with the stored password*, so a burst of
+  // concurrent requests noticing the same expiry must not become a burst of
+  // password posts at a rate-limited bank endpoint. Keyed by the token being
+  // renewed, in-isolate calls share one promise and other isolates reuse the
+  // sealed result from the cache for the next 30 seconds.
+  const sealed = await renewOnce({
+    sessionToken: session.accessToken,
+    cache: defaultCache(),
+    renew: async () => {
+      const outcome = await signIn(env, {
+        emailOrUsername: session.credentials.emailOrUsername,
+        password: session.credentials.password,
+        corporateCode: session.corporateCode,
+      });
+
+      if (outcome.kind !== 'session') return null;
+
+      const renewed: FonepaySession = {
+        ...outcome.session,
+        linkedMerchants: session.linkedMerchants,
+        displayName: session.displayName,
+        renewedAt: Date.now(),
+      };
+
+      return sealSession(renewed, env.SESSION_SECRET);
+    },
   });
 
-  if (outcome.kind !== 'session') return null;
+  if (!sealed) return null;
 
-  const renewed: FonepaySession = {
-    ...outcome.session,
-    linkedMerchants: session.linkedMerchants,
-    displayName: session.displayName,
-    renewedAt: Date.now(),
-  };
-
-  return { session: renewed, sealed: await sealSession(renewed, env.SESSION_SECRET) };
+  const renewed = await openSession<FonepaySession>(sealed, env.SESSION_SECRET);
+  if (!renewed || renewed.provider !== 'fonepay') return null;
+  return { session: renewed, sealed };
 }
 
 /* ------------------------------------------------------------------ */
@@ -330,8 +353,14 @@ app.use(
   corsMiddleware({
     sessionHeader: SESSION_HEADER,
     allowOrigins: (env) => env.ALLOWED_ORIGINS as string | undefined,
+    extraHeaders: [BRIDGE_KEY_HEADER],
   }),
 );
+
+// Manned door: no-op until BRIDGE_KEY is set, then every /api/* call must carry
+// it. This bridge is worse than NepalPay's to leave open — the sealed session
+// holds the password so it can re-sign-in.
+app.use('/api/*', requireBridgeKey());
 
 const requireSession = createMiddleware<AppEnv>(async (c, next) => {
   if (!c.env.SESSION_SECRET) return c.json(secretMissing(), 500);
@@ -393,7 +422,7 @@ app.post('/api/auth/login', async (c) => {
 
   const ip = c.req.header('CF-Connecting-IP') ?? 'unknown';
   const limit = Number(c.env.LOGIN_RATE_LIMIT_PER_MINUTE ?? '') || 10;
-  if (isRateLimited(ip, limit)) {
+  if (await checkRateLimit(c.env, ip, limit)) {
     return c.json(
       errorBody('RATE_LIMITED', 'Too many sign-in attempts. Try again in a minute.'),
       429,
@@ -611,13 +640,107 @@ app.post('/api/auth/logout', (c) =>
 );
 
 /* ------------------------------------------------------------------ */
+/* Collect — take a payment and learn when it lands                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Mint a dynamic QR for an amount and return a ticket to watch it with.
+ *
+ * A unique `remarks` is always written when the caller does not supply one: it is
+ * the only human-readable field Fonepay's collection report echoes back, so it is
+ * what makes a specific payment findable later.
+ */
+app.post('/api/collect', requireSession, async (c) => {
+  const outcome = await startCollect({
+    env: c.env,
+    session: c.get('session'),
+    input: await readJsonBody(c),
+  });
+
+  if (!outcome.ok) {
+    return c.json(errorBody(outcome.code, outcome.message), outcome.status as ContentfulStatusCode);
+  }
+
+  const { ticket } = outcome;
+  const sealed = await sealTicket(ticket, c.env.SESSION_SECRET);
+
+  return c.json(
+    successBody('QR created. Poll statusPath until it reports PAID.', {
+      collectId: ticket.collectId,
+      amount: ticket.amount,
+      remarks: ticket.remarks,
+      orderId: ticket.orderId,
+      qrString: outcome.qrString,
+      expiresAt: ticket.expiresAt,
+      ttlSeconds: Math.round((ticket.expiresAt - ticket.createdAt) / 1000),
+      statusPath: `/api/collect/${sealed}`,
+      retryAfterMs: COLLECT_RETRY_AFTER_MS,
+      keys: ticket.keys,
+      realtime: ticket.realtime ?? null,
+      upstream: {
+        referenceId: ticket.keys.referenceId ?? null,
+        websocketId: ticket.keys.websocketId ?? null,
+      },
+    }),
+  );
+});
+
+/** Poll a collect: PENDING while nothing has arrived, PAID once it has. */
+app.get('/api/collect/:id', requireSession, async (c) => {
+  const ticket = await openTicket(c.req.param('id'), c.env.SESSION_SECRET);
+  if (!ticket) {
+    return c.json(
+      errorBody('INVALID_COLLECT', 'This collect id is invalid or was tampered with.'),
+      401,
+    );
+  }
+
+  if (ticket.provider !== 'fonepay') {
+    return c.json(
+      errorBody('WRONG_PROVIDER', 'This collect id belongs to the NepalPay bridge.'),
+      400,
+    );
+  }
+
+  const outcome = await collectStatus({
+    env: c.env,
+    session: c.get('session'),
+    ticket,
+  });
+
+  const message =
+    outcome.state === 'PAID'
+      ? 'Payment received.'
+      : outcome.state === 'EXPIRED'
+        ? 'This QR expired.'
+        : 'No payment yet.';
+
+  return c.json(
+    successBody(message, {
+      collectId: ticket.collectId,
+      state: outcome.state,
+      amount: ticket.amount,
+      expiresAt: ticket.expiresAt,
+      retryAfterMs: outcome.state === 'PENDING' ? COLLECT_RETRY_AFTER_MS : null,
+      matchedBy: outcome.matchedBy ?? null,
+      transaction: outcome.transaction ?? null,
+      note: outcome.note ?? null,
+      upstreamError: outcome.upstreamError ?? null,
+    }),
+  );
+});
+
+/* ------------------------------------------------------------------ */
 /* Data routes                                                         */
 /* ------------------------------------------------------------------ */
 
 for (const spec of FONEPAY_ROUTES) {
   const handler = async (c: Context<AppEnv>) => {
     let session = c.get('session');
-    const incoming = spec.method === 'POST' ? await readJsonBody(c) : {};
+    // GET routes take their parameters from the query string, POST routes from the
+    // body. Both end up in the same bag, so a path placeholder like `{merchantId}`
+    // or `{transactionId}` can be filled either way.
+    const incoming = spec.method === 'POST' ? await readJsonBody(c) : (c.req.query() ?? {});
 
     let request;
     try {
@@ -637,17 +760,31 @@ for (const spec of FONEPAY_ROUTES) {
         env: c.env,
       });
 
-    let result = await call(session);
+    // Reference routes (`cacheSeconds`) answer from an account-scoped cache —
+    // which also spares them the renew-and-retry dance below on a cache hit.
+    const { result, hit } = await withRefCache({
+      cache: defaultCache(),
+      ttlSeconds: spec.cacheSeconds,
+      route: spec.path,
+      scope: `${session.corporateCode}/${session.username}`,
+      request: { path: request.path, query: request.query, body: request.body ?? null },
+      cacheable: (r) => r.ok,
+      run: async () => {
+        let out = await call(session);
 
-    // The token looked alive but the gateway disagreed: renew once and retry.
-    if (result.status === 401) {
-      const renewed = await renewSession(c.env, session);
-      if (renewed) {
-        session = renewed.session;
-        c.header(SESSION_HEADER, renewed.sealed);
-        result = await call(session);
-      }
-    }
+        // The token looked alive but the gateway disagreed: renew once and retry.
+        if (out.status === 401) {
+          const renewed = await renewSession(c.env, session);
+          if (renewed) {
+            session = renewed.session;
+            c.header(SESSION_HEADER, renewed.sealed);
+            out = await call(session);
+          }
+        }
+        return out;
+      },
+    });
+    if (hit) c.header(REF_CACHE_HEADER, 'HIT');
 
     if (result.status === 401) {
       return c.json(
@@ -685,6 +822,12 @@ app.get('/api/health', (c) =>
       origin: c.env.FONEPAY_ORIGIN ?? '',
       clientCode: clientCode(c.env),
       sessionSecretConfigured: Boolean(c.env.SESSION_SECRET),
+      secure: {
+        bridgeKeyRequired: bridgeKeyOf(c.env) !== null,
+        edgeRateLimiterBound: Boolean(c.env.LOGIN_RATE_LIMITER),
+        allowedOrigins: (c.env.ALLOWED_ORIGINS ?? '') || '*',
+        loginRateLimitPerMinute: Number(c.env.LOGIN_RATE_LIMIT_PER_MINUTE ?? '') || 10,
+      },
       autoRenew: renewEnabled(c.env),
     }),
   ),
@@ -701,6 +844,14 @@ app.get('/api', (c) =>
         'POST /api/auth/refresh',
         'POST /api/auth/logout',
       ],
+      collect: [
+        'POST /api/collect  { amount, remarks?, orderId?, subMerchantId?, terminalId?, expiresInSeconds? }',
+        'GET /api/collect/:id  -> PENDING | PAID | EXPIRED',
+      ],
+      security: {
+        bridgeKeyHeader: BRIDGE_KEY_HEADER,
+        bridgeKeyRequired: bridgeKeyOf(c.env) !== null,
+      },
       endpoints: FONEPAY_ROUTES.map((spec) => ({
         route: `${spec.method} /api${spec.path}`,
         upstream: spec.upstream,

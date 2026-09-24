@@ -1,0 +1,19 @@
+# Third-party notices
+
+This project is MIT licensed (see `LICENSE`). It redistributes one third-party
+component:
+
+## qrcode-generator
+
+- Files: `public-fonepay/vendor/qrcode.js`
+- Version: 2.0.4
+- Author: Kazuhiko Arase
+- License: MIT — https://github.com/kazuhikoarase/qrcode-generator
+
+Vendored rather than loaded from a CDN because the Fonepay widget renders the
+QRCPS payload it receives locally, in the browser, and a payment page should not
+depend on a third-party script host being reachable and honest. The upstream
+copyright notice is preserved in the file's own header.
+
+Everything else in this repository is first-party code. `hono` and the build
+tooling are used as ordinary dependencies and are not redistributed here.

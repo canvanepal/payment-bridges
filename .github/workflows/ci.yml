@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: NepalPay end-to-end
+        run: npm run test:e2e
+
+      - name: Fonepay end-to-end
+        run: npm run test:e2e:fonepay
+
+      # A config that parses locally can still be rejected at deploy time (an
+      # unknown binding, a bad ratelimit period), so validate both bundles too.
+      - name: Dry-run build both Workers
+        run: |
+          npx wrangler deploy --dry-run --outdir /tmp/dry-nepalpay
+          npx wrangler deploy --dry-run --outdir /tmp/dry-fonepay --config wrangler.fonepay.jsonc

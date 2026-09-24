@@ -1,3 +1,4 @@
+import type { RateLimiterBinding } from '../shared/ratelimit';
 import type { SealedSession } from '../shared/session';
 
 /** Bindings available to the Fonepay bridge at runtime. */
@@ -26,6 +27,17 @@ export interface Env {
    * with the credentials kept inside the sealed session.
    */
   FONEPAY_RENEW_ON_EXPIRY?: string;
+  /**
+   * Shared secret every caller must present as `X-Bridge-Key`. Unset means the
+   * bridge is open to anyone who knows its URL. Set with
+   * `wrangler secret put BRIDGE_KEY`.
+   */
+  BRIDGE_KEY?: string;
+  /**
+   * Platform rate-limiter binding declared under `ratelimits` in
+   * wrangler.fonepay.jsonc.
+   */
+  LOGIN_RATE_LIMITER?: RateLimiterBinding;
 }
 
 /**

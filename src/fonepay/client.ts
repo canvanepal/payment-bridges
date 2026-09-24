@@ -169,6 +169,19 @@ function describe(
 }
 
 /**
+ * Unwrap an endpoint's payload.
+ *
+ * Most gateway endpoints nest their result under `data`; a few answer flat. Used
+ * where the bridge needs a response's *fields* rather than just its status —
+ * reading the envelope by mistake yields empty strings and a confusing failure.
+ */
+export function payloadOf(body: unknown): Record<string, unknown> {
+  const root = asJson(body);
+  if (!root) return {};
+  return asJson(root.data) ?? root;
+}
+
+/**
  * Pull the sign-in fields out of whichever shape the gateway replies with.
  * Most endpoints wrap their payload in `data`; the login response has also been
  * seen flat, so both are accepted.

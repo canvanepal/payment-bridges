@@ -1,3 +1,5 @@
+import type { RateLimiterBinding } from '../shared/ratelimit';
+
 /** Bindings available to the Worker at runtime. */
 export interface Env {
   /** Upstream NepalPay origin, e.g. https://business.nepalpay.com.np */
@@ -30,6 +32,17 @@ export interface Env {
    * it is invisible unless deliberately enabled.
    */
   DIAG_TOKEN?: string;
+  /**
+   * Shared secret every caller must present as `X-Bridge-Key`. Unset means the
+   * bridge is open to anyone who knows its URL — fine while wiring a site up,
+   * wrong the moment it is public. Set with `wrangler secret put BRIDGE_KEY`.
+   */
+  BRIDGE_KEY?: string;
+  /**
+   * Platform rate-limiter binding declared under `ratelimits` in wrangler.jsonc.
+   * Counts sign-in attempts across the whole edge rather than per isolate.
+   */
+  LOGIN_RATE_LIMITER?: RateLimiterBinding;
 }
 
 /** Every NepalPay endpoint replies with this envelope. */

@@ -11,6 +11,8 @@ export function corsMiddleware(opts: {
   sessionHeader: string;
   /** Read the allowlist from the Worker's bindings, per request. */
   allowOrigins?: (env: Record<string, unknown>) => string | undefined;
+  /** Extra request header a browser is allowed to send, e.g. the bridge key. */
+  extraHeaders?: string[];
 }) {
   return createMiddleware(async (c, next) => {
     const origin = c.req.header('Origin');
@@ -22,11 +24,15 @@ export function corsMiddleware(opts: {
     const allowOrigin =
       configured.length === 0 ? '*' : origin && configured.includes(origin) ? origin : configured[0];
 
+    const allowHeaders = ['Content-Type', 'Authorization', opts.sessionHeader, ...(opts.extraHeaders ?? [])];
+
     const corsHeaders: Record<string, string> = {
       'Access-Control-Allow-Origin': allowOrigin ?? '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': `Content-Type, Authorization, ${opts.sessionHeader}`,
-      'Access-Control-Expose-Headers': opts.sessionHeader,
+      'Access-Control-Allow-Headers': allowHeaders.join(', '),
+      // Only headers listed here are readable from JS on a cross-origin response,
+      // so the bridge key stays visible to the caller that sent it.
+      'Access-Control-Expose-Headers': [opts.sessionHeader, ...(opts.extraHeaders ?? [])].join(', '),
       'Access-Control-Max-Age': '86400',
       Vary: 'Origin',
     };

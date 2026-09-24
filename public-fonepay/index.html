@@ -225,9 +225,13 @@
 const S = {
   token: sessionStorage.getItem('fp_session') || '',
   user: safeJson(sessionStorage.getItem('fp_user')) || null,
+  /** Shared secret for a bridge that sets BRIDGE_KEY. Sent on every call. */
+  bridgeKey: localStorage.getItem('fp_bridge_key') || '',
   route: (location.hash || '').replace('#', '') || 'overview',
   hierarchy: null,
   calls: 0,
+  /** Live collect being watched, if any. */
+  watch: null,
 };
 
 function safeJson(value) {
@@ -267,6 +271,7 @@ async function api(path, options) {
   const opts = options || {};
   const headers = { Accept: 'application/json' };
   if (S.token) headers.Authorization = 'Bearer ' + S.token;
+  if (S.bridgeKey) headers['X-Bridge-Key'] = S.bridgeKey;
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
 
   S.calls += 1;
@@ -335,6 +340,10 @@ function renderGate(message) {
         '<input id="gPass" type="password" autocomplete="current-password" /></div>' +
       '<div style="margin-top:10px"><label for="gCode">Corporate code <span class="faint">(optional — looked up if blank)</span></label>' +
         '<input id="gCode" placeholder="e.g. 1000001" /></div>' +
+      '<details style="margin-top:12px">' +
+        '<summary>Bridge key <span class="faint">(only if the Worker sets BRIDGE_KEY)</span></summary>' +
+        '<input id="gKey" type="password" autocomplete="off" placeholder="X-Bridge-Key value" value="' + esc(S.bridgeKey) + '" style="margin-top:8px" />' +
+      '</details>' +
       '<div class="row" style="margin-top:14px"><div class="tight">' +
         '<button class="primary" id="gSubmit" onclick="signIn()">Sign in</button></div>' +
         '<div class="tight"><button onclick="document.getElementById(\'gPass\').value=\'\'">Clear</button></div>' +
@@ -397,6 +406,16 @@ async function signIn() {
   const password = $('gPass').value;
   const corporateCode = $('gCode').value.trim();
   if (!emailOrUsername || !password) return toast('Username and password are required.', true);
+
+  // The key is the caller's identity, not a credential for Fonepay, so it is
+  // kept locally and re-sent on every call rather than only at sign-in.
+  if ($('gKey') && $('gKey').value.trim() !== S.bridgeKey) {
+    S.bridgeKey = $('gKey').value.trim();
+    try {
+      if (S.bridgeKey) localStorage.setItem('fp_bridge_key', S.bridgeKey);
+      else localStorage.removeItem('fp_bridge_key');
+    } catch { /* private mode */ }
+  }
 
   $('gSubmit').disabled = true;
   $('gSubmit').textContent = 'Signing in…';
@@ -476,6 +495,7 @@ const NAV = [
   { id: 'transactions', label: 'Transactions', icon: '≡' },
   { id: 'settlements', label: 'Settlements', icon: '⧉' },
   { id: 'qr', label: 'QR codes', icon: '▣' },
+  { id: 'pay', label: 'Take payment', icon: '◉' },
   { group: 'Account' },
   { id: 'merchants', label: 'Merchants', icon: '⌂' },
   { id: 'users', label: 'Users & profile', icon: '☺' },
@@ -487,6 +507,7 @@ const TITLES = {
   transactions: ['Transactions', 'Collection transactions for a date range'],
   settlements: ['Settlements', 'Settlement report for a date range'],
   qr: ['QR codes', 'Static and dynamic Fonepay QR'],
+  pay: ['Take payment', 'Mint a tracked QR and watch for the payment'],
   merchants: ['Merchants', 'Linked merchants, hierarchy and access'],
   users: ['Users & profile', 'Corporate users and the signed-in profile'],
   api: ['API & session', 'Routes this bridge exposes, and session state'],
@@ -830,6 +851,127 @@ async function generateQr(kind) {
   } catch (error) {
     out.innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
   }
+}
+
+/* --- take payment --------------------------------------------------- */
+/*
+ * A collect is a QR the bridge can *recognise* later. The status call scans the
+ * collection report for this payment's own remark, so it cannot confuse it with
+ * another terminal's sale of the same amount.
+ */
+VIEWS.pay = async (root) => {
+  const h = await hierarchy().catch(() => ({ flat: [] }));
+
+  root.innerHTML =
+    '<div class="grid c2">' +
+      '<section class="card"><h2>Charge <span class="sub">amount, optional order ref</span></h2><div class="pad">' +
+        '<div class="row">' + field('payAmount', 'Amount (NPR)', 'number', '100') + field('payOrder', 'Order id (optional)', 'text', '') + '</div>' +
+        '<div style="margin-top:10px"><label for="payRemarks">Remarks <span class="faint">(blank = a unique one is generated)</span></label>' +
+          '<input id="payRemarks" placeholder="" /></div>' +
+        '<div style="margin-top:10px"><label for="payStation">Terminal</label><select id="payStation">' + terminalOptions(h) + '</select></div>' +
+        '<div class="row" style="margin-top:12px"><div class="tight"><button class="primary" onclick="startCollect()">Take payment</button></div>' +
+          '<div class="tight"><button onclick="stopCollect()">Stop watching</button></div></div>' +
+        '<div class="muted" style="font-size:12px;margin-top:10px">The report has no order-id column, so the ' +
+          'remark is what makes this payment findable. Leave it blank and the bridge writes a unique one.</div>' +
+      '</div></section>' +
+      '<section class="card"><h2>Status <span class="sub">polls until paid or expired</span></h2>' +
+        '<div id="payOut"><div class="empty">Nothing being watched yet.</div></div></section>' +
+    '</div>';
+};
+
+async function startCollect() {
+  stopCollect();
+  const option = $('payStation').selectedOptions[0];
+  if (!option || !option.value) return toast('Pick a terminal first.', true);
+
+  const amount = Number($('payAmount').value || 0);
+  if (!Number.isFinite(amount) || amount <= 0) return toast('Enter an amount.', true);
+
+  const out = $('payOut');
+  out.innerHTML = '<div class="empty">Minting a tracked QR…</div>';
+
+  let result;
+  try {
+    result = await api('/collect', {
+      body: {
+        amount: amount,
+        remarks: $('payRemarks').value,
+        orderId: $('payOrder').value,
+        merchantId: option.dataset.merchant,
+        subMerchantId: option.dataset.sub ? Number(option.dataset.sub) : undefined,
+        terminalId: Number(option.value),
+      },
+    });
+  } catch (error) {
+    out.innerHTML = '<div class="banner bad">' + esc(error.message) + '</div>';
+    return;
+  }
+
+  const data = result.data || {};
+  S.watch = data;
+
+  out.innerHTML =
+    '<div class="pad qrwrap">' +
+      '<div class="qrimg">' + qrSvg(data.qrString) + '</div>' +
+      '<div style="flex:1 1 220px;min-width:200px">' +
+        '<dl class="kv">' +
+          '<dt>Amount</dt><dd>' + esc(money(data.amount)) + '</dd>' +
+          '<dt>Collect</dt><dd>' + esc(data.collectId) + '</dd>' +
+          '<dt>Remarks</dt><dd>' + esc(data.remarks) + '</dd>' +
+          '<dt>Order id</dt><dd>' + esc(data.orderId) + '</dd>' +
+          '<dt>Expires</dt><dd id="payExpiry">' + esc(new Date(data.expiresAt).toLocaleTimeString()) + '</dd>' +
+          '<dt>Reference</dt><dd>' + esc(data.keys?.referenceId || '—') + '</dd>' +
+        '</dl>' +
+        '<div id="payBar" class="row" style="margin-top:12px"><span class="pill warn"><span class="dot"></span>waiting for payment…</span></div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="pad">' +
+      '<details><summary>Collect envelope</summary><pre>' + esc(JSON.stringify(result, null, 2)) + '</pre></details>' +
+    '</div>';
+
+  S.watchTimer = setInterval(pollCollect, Math.max(1500, Number(data.retryAfterMs || 3000)));
+  pollCollect();
+}
+
+function stopCollect() {
+  if (S.watchTimer) clearInterval(S.watchTimer);
+  S.watchTimer = null;
+  const bar = $('payBar');
+  if (bar) bar.innerHTML = '<span class="pill"><span class="dot"></span>stopped</span>';
+}
+
+async function pollCollect() {
+  if (!S.watch || !S.watchTimer) return;
+  let result;
+  try {
+    // statusPath already starts with /api, which api() adds itself.
+    result = await api(String(S.watch.statusPath || '').replace(/^\/api/, ''), { method: 'GET' });
+  } catch (error) {
+    // Keep watching: a single failed poll is not a failed payment.
+    return;
+  }
+
+  const data = result.data || {};
+  const bar = $('payBar');
+  if (!bar) return;
+
+  if (data.state === 'PAID') {
+    stopCollect();
+    const txn = data.transaction || {};
+    bar.innerHTML = '<span class="pill ok"><span class="dot"></span>paid ' + esc(money(txn.amount ?? S.watch.amount)) +
+      (txn.customerMobile ? ' · ' + esc(txn.customerMobile) : '') + ' · matched by ' + esc(data.matchedBy || '—') + '</span>';
+    toast('Payment received.');
+    return;
+  }
+
+  if (data.state === 'EXPIRED') {
+    stopCollect();
+    bar.innerHTML = '<span class="pill warn"><span class="dot"></span>expired unpaid</span>';
+    return;
+  }
+
+  bar.innerHTML = '<span class="pill warn"><span class="dot"></span>' +
+    (data.upstreamError ? 'report unreadable, still trying' : 'no payment yet') + '</span>';
 }
 
 function qrSvg(payload) {

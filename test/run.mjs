@@ -490,6 +490,521 @@ check('fonepay base urls default to the corporate gateway',
 check('fonepay base urls can be overridden', fpClient.apiBase({ FONEPAY_API_BASE_URL: 'http://127.0.0.1:9/x/' }) === 'http://127.0.0.1:9/x');
 check('client code defaults to CORPORATE_USER', fpClient.clientCode({}) === 'CORPORATE_USER');
 
+/* ---------------- Shared: bridge key ---------------- */
+
+const bridgeKey = await bundle('src/shared/bridge-key.ts', 'bridge-key.mjs');
+
+check('the bridge key header is X-Bridge-Key', bridgeKey.BRIDGE_KEY_HEADER === 'X-Bridge-Key');
+check('a blank bridge key counts as unset', bridgeKey.bridgeKeyOf({ BRIDGE_KEY: '   ' }) === null);
+check('a missing bridge key counts as unset', bridgeKey.bridgeKeyOf({}) === null);
+check('a configured bridge key is trimmed and returned', bridgeKey.bridgeKeyOf({ BRIDGE_KEY: ' k ' }) === 'k');
+check('equal secrets match', bridgeKey.secretsMatch('s3cret', 's3cret'));
+check('a differing secret does not match', !bridgeKey.secretsMatch('s3cret', 's3cres'));
+check('a prefix of the secret does not match', !bridgeKey.secretsMatch('s3cret', 's3cret-longer'));
+check('an empty presented secret does not match', !bridgeKey.secretsMatch('', 's3cret'));
+
+/** Run the middleware against a stub context that only implements what it uses. */
+const runBridgeKey = async (env, presented) => {
+  let passed = false;
+  const outcome = await bridgeKey.requireBridgeKey()(
+    {
+      env,
+      req: { header: () => presented },
+      json: (body, status) => ({ body, status }),
+    },
+    async () => {
+      passed = true;
+    },
+  );
+  return { outcome, passed };
+};
+
+const openBridge = await runBridgeKey({}, undefined);
+check('an unconfigured bridge lets calls through', openBridge.passed && openBridge.outcome === undefined);
+
+const missingKey = await runBridgeKey({ BRIDGE_KEY: 'k' }, undefined);
+check(
+  'a closed bridge refuses a caller with no key',
+  missingKey.outcome?.status === 401 && missingKey.outcome?.body?.code === 'BRIDGE_KEY_REQUIRED',
+  missingKey.outcome?.body?.code,
+);
+
+const wrongKey = await runBridgeKey({ BRIDGE_KEY: 'k' }, 'nope');
+check(
+  'a closed bridge refuses the wrong key',
+  wrongKey.outcome?.status === 401 && wrongKey.outcome?.body?.code === 'BRIDGE_KEY_INVALID',
+  wrongKey.outcome?.body?.code,
+);
+
+const rightKey = await runBridgeKey({ BRIDGE_KEY: 'k' }, 'k');
+check('a closed bridge admits the right key', rightKey.passed && rightKey.outcome === undefined);
+
+/* ---------------- Shared: collect primitives ---------------- */
+
+const collect = await bundle('src/shared/collect.ts', 'collect.mjs');
+
+check(
+  'a collect id is prefixed, dated and random',
+  /^NP-\d{8}-[0-9A-F]{6}$/.test(collect.newCollectId('NP', Date.parse('2026-09-24T10:00:00Z'))),
+  collect.newCollectId('NP', Date.parse('2026-09-24T10:00:00Z')),
+);
+check('two collect ids differ', collect.newCollectId('NP') !== collect.newCollectId('NP'));
+check('an amount parses from a string', collect.parseAmount('125.50') === 125.5);
+check('an amount is rounded to paisa', collect.parseAmount(10.005) === 10.01 || collect.parseAmount(10.005) === 10,
+  String(collect.parseAmount(10.005)));
+check('a zero amount is refused', collect.parseAmount(0) === null);
+check('a negative amount is refused', collect.parseAmount('-5') === null);
+check('a non-numeric amount is refused', collect.parseAmount('abc') === null);
+check('a missing amount is refused', collect.parseAmount(undefined) === null);
+check('amounts compare within a paisa', collect.amountsEqual(100, 100.005));
+check('a two-paisa gap is not the same amount', !collect.amountsEqual(100, 100.02));
+check(
+  'a ticket ttl is clamped to the supported range',
+  collect.clampTtl(5) === 60 && collect.clampTtl(100_000) === 900 && collect.clampTtl(undefined) === 600 && collect.clampTtl(300) === 300,
+);
+check(
+  'rows are found under result, content and list',
+  collect.rowsFrom({ data: { result: [1, 2] } }).length === 2 &&
+    collect.rowsFrom({ content: [1] }).length === 1 &&
+    collect.rowsFrom({ list: [1, 2, 3] }).length === 3,
+);
+check('an unknown envelope shape yields no rows', collect.rowsFrom({ total: 5 }).length === 0);
+check('a null payload yields no rows', collect.rowsFrom(null).length === 0);
+check('a row carrying a correlation value is recognised', collect.rowCarriesValue({ addnField3: 'TRACE-1' }, ['trace-1']));
+check('an identifier nested in the row is recognised', collect.rowCarriesValue({ data: { payer: { ref: 'abc' } } }, ['ABC']));
+check('an identifier in a list inside the row is recognised', collect.rowCarriesValue({ refs: [{ id: 'T9' }] }, ['T9']));
+check('an unrelated row is not a match', !collect.rowCarriesValue({ instructionId: 'NQR-1' }, ['TRACE-1']));
+check('a numeric row field matches as a string', collect.rowCarriesValue({ sessionSrlNo: 14518 }, ['14518']));
+
+const createdAt = Date.parse('2026-09-24T10:00:00Z');
+check(
+  'an ISO timestamp inside the window is accepted',
+  collect.withinWindow(new Date(createdAt + 60_000).toISOString(), { createdAt }),
+);
+check(
+  'an ISO timestamp before the window is rejected',
+  !collect.withinWindow(new Date(createdAt - 3_600_000).toISOString(), { createdAt }),
+);
+check('an unparseable timestamp is rejected', !collect.withinWindow('not a date', { createdAt }));
+check('a missing timestamp is rejected', !collect.withinWindow(undefined, { createdAt }));
+check(
+  'a Nepal-local "YYYY-MM-DD HH:MM:SS" stamp is pinned to +05:45',
+  collect.withinWindow('2026-09-24 15:45:00', { createdAt }),
+);
+check(
+  'a Nepal-local stamp is not read as UTC',
+  !collect.withinWindow('2026-09-24 09:00:00', { createdAt }),
+);
+
+/* ---------------- Shared: collect ticket sealing ---------------- */
+
+const ticketPayload = {
+  v: 1,
+  provider: 'nepalpay',
+  collectId: 'NP-20260924-ABCDEF',
+  amount: 100,
+  remarks: 'Bridge collect NP-20260924-ABCDEF',
+  orderId: 'NP-20260924-ABCDEF',
+  keys: { validationTraceId: 'TRACE-1' },
+  createdAt,
+  expiresAt: createdAt + 600_000,
+};
+
+const sealedTicket = await collect.sealTicket(ticketPayload, secret);
+const openedTicket = await collect.openTicket(sealedTicket, secret);
+check('a collect ticket round-trips', openedTicket?.keys.validationTraceId === 'TRACE-1');
+check(
+  'a collect ticket sealed with another secret is refused',
+  (await collect.openTicket(sealedTicket, randomBytes(32).toString('base64url'))) === null,
+);
+check('a mangled collect ticket is refused', (await collect.openTicket(`${sealedTicket}AAA`, secret)) === null);
+check('a session token is not accepted as a collect ticket', (await collect.openTicket(sealed, secret)) === null);
+check('a collect token is not accepted as a session', (await openSession(sealedTicket, secret)) === null);
+
+/* ---------------- NepaliPay: payment matching ---------------- */
+
+const npCollect = await bundle('src/nepalpay/collect.ts', 'np-collect.mjs');
+const npValues = Object.values(ticketPayload.keys);
+
+check(
+  'a row carrying the collected trace id is a match',
+  npCollect.matchRow({ validationTraceId: 'TRACE-1', amount: 100 }, ticketPayload, npValues)?.matchedBy ===
+    'validationTraceId',
+);
+check(
+  'a matching trace id with the wrong amount is not a payment',
+  npCollect.matchRow({ validationTraceId: 'TRACE-1', amount: 999 }, ticketPayload, npValues) === null,
+);
+check(
+  'a row with no ids but the right amount and a fresh time matches',
+  npCollect.matchRow(
+    { amount: 100, localTransactionDateTime: new Date(createdAt + 30_000).toISOString() },
+    ticketPayload,
+    npValues,
+  )?.matchedBy === 'amount+time',
+);
+check(
+  'a stale row with the right amount is not a match',
+  npCollect.matchRow(
+    { amount: 100, localTransactionDateTime: new Date(createdAt - 6 * 3_600_000).toISOString() },
+    ticketPayload,
+    npValues,
+  ) === null,
+);
+check(
+  'an identifier found in an undocumented field still matches',
+  npCollect.matchRow({ amount: 100, addnField7: 'TRACE-1' }, ticketPayload, npValues)?.matchedBy === 'value-scan',
+);
+check(
+  'the order id in merchantTxnRef counts as a match',
+  npCollect.matchRow(
+    { amount: 100, merchantTxnRef: 'NP-20260924-ABCDEF,bill' },
+    ticketPayload,
+    npValues,
+  ) === null,
+  'a composite ref is not an exact equality match',
+);
+check('a non-object row is ignored', npCollect.matchRow('nope', ticketPayload, npValues) === null);
+check('a null row is ignored', npCollect.matchRow(null, ticketPayload, npValues) === null);
+
+/* ---------------- Fonepay: payment matching ---------------- */
+
+const fpCollect = await bundle('src/fonepay/collect.ts', 'fp-collect.mjs');
+const fpTicketPayload = {
+  ...ticketPayload,
+  provider: 'fonepay',
+  collectId: 'FP-20260924-123456',
+  amount: 250,
+  remarks: 'Bridge collect FP-20260924-123456',
+  orderId: 'FP-20260924-123456',
+  keys: { remarks: 'Bridge collect FP-20260924-123456', orderId: 'FP-20260924-123456' },
+};
+const fpValues = Object.values(fpTicketPayload.keys);
+
+check(
+  'a Fonepay row with the collected remarks is a match',
+  fpCollect.matchRow(
+    { remarks: 'Bridge collect FP-20260924-123456', amount: 250, paymentStatus: 'Success' },
+    fpTicketPayload,
+    fpValues,
+  )?.matchedBy === 'remarks',
+);
+check(
+  'the second remarks column also matches',
+  fpCollect.matchRow(
+    { remarks1: 'Bridge collect FP-20260924-123456', amount: 250, paymentStatus: 'Success' },
+    fpTicketPayload,
+    fpValues,
+  )?.matchedBy === 'remarks1',
+);
+check(
+  'a failed payment with the right remarks is not a payment',
+  fpCollect.matchRow(
+    { remarks: 'Bridge collect FP-20260924-123456', amount: 250, paymentStatus: 'Failed' },
+    fpTicketPayload,
+    fpValues,
+  ) === null,
+);
+check(
+  'another merchant paying the same amount is not a payment',
+  fpCollect.matchRow({ remarks: 'lunch', amount: 250, paymentStatus: 'Success' }, fpTicketPayload, fpValues) ===
+    null,
+);
+check(
+  'the order id echoed into referenceId matches',
+  fpCollect.matchRow(
+    { referenceId: 'FP-20260924-123456', amount: 250, paymentStatus: 'Success' },
+    fpTicketPayload,
+    fpValues,
+  )?.matchedBy === 'referenceId',
+);
+
+/* ---------------- Shared: json cache ---------------- */
+
+const kvcache = await bundle('src/shared/kvcache.ts', 'kvcache.mjs');
+
+const fakeCache = () => {
+  const store = new Map();
+  return {
+    store,
+    match: async (request) => {
+      const hit = store.get(request.url);
+      return hit ? new Response(hit, { headers: { 'Content-Type': 'application/json' } }) : undefined;
+    },
+    put: async (request, response) => {
+      store.set(request.url, await response.text());
+    },
+  };
+};
+
+check('a hash key is 32 hex characters', /^[0-9a-f]{32}$/.test(await kvcache.hashKey('anything')));
+check('a hash key is stable', (await kvcache.hashKey('a')) === (await kvcache.hashKey('a')));
+check('different inputs hash differently', (await kvcache.hashKey('a')) !== (await kvcache.hashKey('b')));
+
+const cacheStore = fakeCache();
+check('a missing cache entry reads as null', (await kvcache.cacheGet(cacheStore, 'nope')) === null);
+await kvcache.cachePut(cacheStore, 'k', { sealed: 's' }, 30);
+check('a written entry reads back', (await kvcache.cacheGet(cacheStore, 'k'))?.sealed === 's');
+check('an absent cache never throws', (await kvcache.cacheGet(null, 'k')) === null);
+await kvcache.cachePut(null, 'k', { sealed: 's' }, 30);
+
+const throwingCache = {
+  match: async () => {
+    throw new Error('no cache here');
+  },
+  put: async () => {
+    throw new Error('no cache here');
+  },
+};
+check('a throwing cache degrades to a miss', (await kvcache.cacheGet(throwingCache, 'k')) === null);
+check(
+  'a throwing cache does not fail the write',
+  (await kvcache.cachePut(throwingCache, 'k', {}, 30)) === undefined,
+);
+
+let collapsed = 0;
+const registry = new Map();
+const burst = await Promise.all(
+  [1, 2, 3, 4].map(() =>
+    kvcache.inFlightOnce(registry, 'same', async () => {
+      collapsed += 1;
+      return 'done';
+    }),
+  ),
+);
+check('a concurrent burst runs the work once', collapsed === 1, String(collapsed));
+check('every caller in the burst gets the result', burst.every((value) => value === 'done'));
+check('the registry is emptied afterwards', registry.size === 0);
+
+/* ---------------- Shared: renewal de-duplication ---------------- */
+
+const renewal = await bundle('src/shared/renewal.ts', 'renewal.mjs');
+
+let renewCalls = 0;
+const renewalCache = fakeCache();
+const renewResults = await Promise.all(
+  [1, 2, 3].map(() =>
+    renewal.renewOnce({
+      sessionToken: 'session-token-1',
+      cache: renewalCache,
+      renew: async () => {
+        renewCalls += 1;
+        return 'sealed-session';
+      },
+    }),
+  ),
+);
+check('a burst of renewals collapses into one upstream call', renewCalls === 1, String(renewCalls));
+check('every caller receives the renewed session', renewResults.every((value) => value === 'sealed-session'));
+
+// A second isolate has its own in-flight map but the same cache.
+renewal.resetRenewals();
+let secondIsolateCalls = 0;
+const reused = await renewal.renewOnce({
+  sessionToken: 'session-token-1',
+  cache: renewalCache,
+  renew: async () => {
+    secondIsolateCalls += 1;
+    return 'sealed-session-2';
+  },
+});
+check('another isolate reuses the cached renewal', secondIsolateCalls === 0 && reused === 'sealed-session');
+
+renewal.resetRenewals();
+let failedCalls = 0;
+const failedRenewal = await renewal.renewOnce({
+  sessionToken: 'session-token-2',
+  cache: renewalCache,
+  renew: async () => {
+    failedCalls += 1;
+    return null;
+  },
+});
+const recoveredRenewal = await renewal.renewOnce({
+  sessionToken: 'session-token-2',
+  cache: renewalCache,
+  renew: async () => {
+    failedCalls += 1;
+    return 'recovered';
+  },
+});
+check(
+  'a failed renewal is not cached',
+  failedRenewal === null && recoveredRenewal === 'recovered',
+  String(failedCalls),
+);
+
+renewal.resetRenewals();
+let nullCached = 0;
+const nullResult = await renewal.renewOnce({
+  sessionToken: 'session-token-3',
+  cache: renewalCache,
+  renew: async () => {
+    nullCached += 1;
+    return null;
+  },
+});
+check('a null renewal result is passed through', nullResult === null && nullCached === 1);
+
+renewal.resetRenewals();
+let triedTwice = 0;
+await renewal.renewOnce({ sessionToken: 's4', cache: null, renew: async () => { triedTwice += 1; return null; } });
+await renewal.renewOnce({ sessionToken: 's4', cache: null, renew: async () => { triedTwice += 1; return null; } });
+check('without a cache each serial call retries once', triedTwice === 2, String(triedTwice));
+
+/* ---------------- Shared: reference-route cache ---------------- */
+
+const refcache = await bundle('src/shared/refcache.ts', 'refcache.mjs');
+
+check('the cache-hit header is X-Bridge-Cache', refcache.REF_CACHE_HEADER === 'X-Bridge-Cache');
+
+const refStore = fakeCache();
+const refBase = {
+  cache: refStore,
+  ttlSeconds: 60,
+  route: '/banks',
+  scope: 'MERCHANT0001',
+  request: { upstream: '/backend/api/bank/list', body: {} },
+  cacheable: (r) => r.status >= 200 && r.status < 300,
+};
+
+let refRuns = 0;
+const refRun = async () => {
+  refRuns += 1;
+  return { status: 200, data: ['a'] };
+};
+
+const refFirst = await refcache.withRefCache({ ...refBase, run: refRun });
+check('a reference call runs upstream on a cold cache', !refFirst.hit && refRuns === 1, String(refRuns));
+
+const refSecond = await refcache.withRefCache({ ...refBase, run: refRun });
+check(
+  'the next identical call is served from cache',
+  refSecond.hit && refRuns === 1 && refSecond.result.data[0] === 'a',
+  String(refRuns),
+);
+
+const refOtherMerchant = await refcache.withRefCache({ ...refBase, scope: 'MERCHANT0002', run: refRun });
+check('another merchant never sees that entry', !refOtherMerchant.hit && refRuns === 2, String(refRuns));
+
+const refOtherRequest = await refcache.withRefCache({
+  ...refBase,
+  request: { upstream: '/backend/api/bank/list', body: { page: 2 } },
+  run: refRun,
+});
+check('a different request hashes to a different entry', !refOtherRequest.hit && refRuns === 3, String(refRuns));
+
+let failRuns = 0;
+const refFailing = {
+  ...refBase,
+  route: '/settlement',
+  run: async () => {
+    failRuns += 1;
+    return { status: 500 };
+  },
+};
+await refcache.withRefCache(refFailing);
+await refcache.withRefCache(refFailing);
+check('a failed response is never cached', failRuns === 2, String(failRuns));
+
+let ttlRuns = 0;
+const refNoTtl = {
+  ...refBase,
+  ttlSeconds: 0,
+  route: '/no-ttl',
+  run: async () => {
+    ttlRuns += 1;
+    return { status: 200 };
+  },
+};
+await refcache.withRefCache(refNoTtl);
+await refcache.withRefCache(refNoTtl);
+check('a route without a TTL always calls upstream', ttlRuns === 2, String(ttlRuns));
+
+let nullCacheRuns = 0;
+const refNoCache = {
+  ...refBase,
+  cache: null,
+  route: '/no-cache',
+  run: async () => {
+    nullCacheRuns += 1;
+    return { status: 200 };
+  },
+};
+await refcache.withRefCache(refNoCache);
+await refcache.withRefCache(refNoCache);
+check('without a cache every call goes upstream', nullCacheRuns === 2, String(nullCacheRuns));
+
+let hostileRuns = 0;
+const hostileRefCache = {
+  match: async () => {
+    throw new Error('no cache here');
+  },
+  put: async () => {
+    throw new Error('no cache here');
+  },
+};
+const refHostile = {
+  ...refBase,
+  cache: hostileRefCache,
+  route: '/hostile',
+  run: async () => {
+    hostileRuns += 1;
+    return { status: 200 };
+  },
+};
+const hostileFirst = await refcache.withRefCache(refHostile);
+const hostileSecond = await refcache.withRefCache(refHostile);
+check(
+  'a throwing cache still answers, just uncached',
+  !hostileFirst.hit && !hostileSecond.hit && hostileRuns === 2,
+  String(hostileRuns),
+);
+
+/* ---------------- Shared: two-layer rate limit ---------------- */
+
+const ratelimit = await bundle('src/shared/ratelimit.ts', 'ratelimit.mjs');
+
+ratelimit.resetRateLimit();
+check(
+  'the in-isolate counter trips on the fourth call of a limit of three',
+  !ratelimit.isRateLimited('k', 3) &&
+    !ratelimit.isRateLimited('k', 3) &&
+    !ratelimit.isRateLimited('k', 3) &&
+    ratelimit.isRateLimited('k', 3),
+);
+
+ratelimit.resetRateLimit();
+check(
+  'separate keys are counted separately',
+  !ratelimit.isRateLimited('a', 1) && !ratelimit.isRateLimited('b', 1) && ratelimit.isRateLimited('a', 1),
+);
+
+const denyLimiter = { limit: async () => ({ success: false }) };
+check(
+  'the edge limiter denies when it says deny',
+  (await ratelimit.checkRateLimit({ LOGIN_RATE_LIMITER: denyLimiter }, 'x', 10)) === true,
+);
+
+const allowLimiter = { limit: async () => ({ success: true }) };
+ratelimit.resetRateLimit();
+check(
+  'the edge limiter allows when it says allow',
+  (await ratelimit.checkRateLimit({ LOGIN_RATE_LIMITER: allowLimiter }, 'x', 1)) === false,
+);
+
+const brokenLimiter = {
+  limit: async () => {
+    throw new Error('binding unavailable');
+  },
+};
+ratelimit.resetRateLimit();
+check(
+  'a broken limiter does not fail open',
+  (await ratelimit.checkRateLimit({ LOGIN_RATE_LIMITER: brokenLimiter }, 'y', 1)) === false &&
+    (await ratelimit.checkRateLimit({ LOGIN_RATE_LIMITER: brokenLimiter }, 'y', 1)) === true,
+);
+
 rmSync(outDir, { recursive: true, force: true });
 
 console.log(results.join('\n'));

@@ -28,7 +28,10 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
+
+  /** Header the bridge expects its own shared secret in, when one is configured. */
+  const BRIDGE_KEY_HEADER = 'X-Bridge-Key';
 
   /** Route table, mirroring src/routes.ts so helpers cannot drift. */
   const ROUTES = {
@@ -53,6 +56,7 @@
     users: ['POST', '/api/users'],
     roles: ['GET', '/api/users/roles'],
     banks: ['POST', '/api/banks'],
+    collect: ['POST', '/api/collect'],
     me: ['GET', '/api/auth/me'],
     refresh: ['POST', '/api/auth/refresh'],
     logout: ['POST', '/api/auth/logout'],
@@ -76,6 +80,13 @@
     REFRESH_NOT_CONFIGURED: 'Renewal is switched off on the Worker.',
     REFRESH_FAILED: 'The refresh token was rejected. Sign in again.',
     NETWORK_ERROR: 'The request never reached the Worker — check the base URL and CORS.',
+    BRIDGE_KEY_REQUIRED:
+      'This bridge is closed: it needs a shared secret. Pass bridgeKey to createClient (or leave BRIDGE_KEY unset on the Worker while wiring a site up).',
+    BRIDGE_KEY_INVALID: 'The bridge key was rejected. It does not match the Worker\'s BRIDGE_KEY.',
+    INVALID_COLLECT: 'That collect handle is invalid or was tampered with. Start a new collect.',
+    WRONG_PROVIDER: 'That collect id belongs to the other bridge (NepalPay vs Fonepay).',
+    COLLECT_EXPIRED: 'The QR expired before it was paid. Generate a new one.',
+    COLLECT_TIMEOUT: 'No payment arrived in time. The QR may still be valid — the watcher just stopped waiting.',
   };
 
   class NepalPayError extends Error {
@@ -112,6 +123,7 @@
     if (!doFetch) throw new Error('No fetch available. Pass one in options.fetch (Node 18+ has a global fetch).');
 
     const timeoutMs = options.timeout === undefined ? 20000 : options.timeout;
+    const bridgeKey = options.bridgeKey ? String(options.bridgeKey) : '';
 
     const client = {
       baseUrl,
@@ -133,6 +145,7 @@
     async function request(path, { method = 'POST', body, allowFailure = false } = {}) {
       const headers = {};
       if (client.session) headers.Authorization = 'Bearer ' + client.session;
+      if (bridgeKey) headers[BRIDGE_KEY_HEADER] = bridgeKey;
       if (body !== undefined && method !== 'GET') headers['Content-Type'] = 'application/json';
 
       const controller = timeoutMs && typeof AbortController === 'function' ? new AbortController() : null;
@@ -288,6 +301,101 @@
     client.terminalQr = (storeLabel, terminal) =>
       call('terminalQr', { storeLabel: storeLabel || '', terminal: terminal || '' });
 
+    /* ---------------- collect: take a payment ---------------- */
+
+    /**
+     * Mint a dynamic QR and return a handle to watch it with.
+     *
+     *   const qr = await np.collect(250, { remarks: 'Order 1042' });
+     *   showQr(qr.qrString);
+     *   const paid = await np.waitForPaid(qr);   // resolves when it is paid
+     */
+    client.collect = async function (amount, collectOptions) {
+      collectOptions = collectOptions || {};
+      const value = Number(amount && typeof amount === 'object' ? amount.amount : amount);
+      if (!Number.isFinite(value) || value <= 0) throw new Error('collect needs an amount greater than zero');
+
+      const data = await call('collect', {
+        amount: value,
+        storeLabel: collectOptions.storeLabel || collectOptions.store || '',
+        terminal: collectOptions.terminal || '',
+        remarks: collectOptions.remarks || '',
+        orderId: collectOptions.orderId || '',
+        expiresInSeconds: collectOptions.expiresInSeconds,
+      });
+
+      return {
+        collectId: data.collectId,
+        /** A `data:image/png;base64,…` QR, ready for an <img src>. */
+        qrString: data.qrString,
+        amount: data.amount,
+        remarks: data.remarks,
+        orderId: data.orderId,
+        expiresAt: data.expiresAt,
+        /** Sealed; POST it back exactly as-is via collectStatus/waitForPaid. */
+        statusPath: data.statusPath,
+        retryAfterMs: data.retryAfterMs || 2500,
+        keys: data.keys || {},
+        /** Live-notification material, if the caller wants to watch it directly. */
+        realtime: data.realtime || null,
+      };
+    };
+
+    /** One status check. Resolves `{ state: 'PENDING' | 'PAID' | 'EXPIRED', ... }`. */
+    client.collectStatus = async function (handle) {
+      const path =
+        typeof handle === 'string'
+          ? handle
+          : handle && (handle.statusPath || (handle.collectId ? '/api/collect/' + handle.collectId : ''));
+      if (!path) throw new Error('collectStatus needs a handle from collect()');
+      const result = await request(path, { method: 'GET' });
+      return result.envelope.data;
+    };
+
+    /**
+     * Poll a collect until it is paid.
+     *
+     * Resolves with the status (including the matched transaction). Rejects with
+     * COLLECT_EXPIRED if the QR lapsed, COLLECT_TIMEOUT if we stopped waiting, or
+     * an abort if `signal` fires. The bridge throttles its own repeat scans, so
+     * several watchers of one QR do not multiply the upstream load.
+     */
+    client.waitForPaid = async function (handle, waitOptions) {
+      waitOptions = waitOptions || {};
+      const timeoutMs = waitOptions.timeoutMs === undefined ? 300000 : waitOptions.timeoutMs;
+      const cap = waitOptions.maxIntervalMs || 5000;
+      const deadline = Date.now() + timeoutMs;
+
+      for (;;) {
+        const status = await client.collectStatus(handle);
+        if (waitOptions.onStatus) waitOptions.onStatus(status);
+
+        if (status.state === 'PAID') return status;
+        if (status.state === 'EXPIRED') {
+          if (waitOptions.resolveOnExpiry) return status;
+          throw new NepalPayError(
+            { code: 'COLLECT_EXPIRED', message: HELP.COLLECT_EXPIRED },
+            410,
+            handle && handle.statusPath,
+          );
+        }
+
+        const now = Date.now();
+        if (now >= deadline) {
+          if (waitOptions.resolveOnTimeout) return status;
+          throw new NepalPayError(
+            { code: 'COLLECT_TIMEOUT', message: HELP.COLLECT_TIMEOUT, data: status },
+            408,
+            handle && handle.statusPath,
+          );
+        }
+
+        const suggested =
+          waitOptions.intervalMs || status.retryAfterMs || (handle && handle.retryAfterMs) || 2500;
+        await sleep(Math.min(cap, Math.max(500, suggested)), waitOptions.signal);
+      }
+    };
+
     /* ---------------- reports ---------------- */
 
     client.reports = {
@@ -392,6 +500,19 @@
       origin: location.origin,
     });
 
+    // The session and the bridge key are handed to the frame over postMessage
+    // rather than the URL, so neither lands in history, a referrer or a log.
+    const postConfig = () =>
+      frame.contentWindow.postMessage(
+        {
+          source: 'nepalpay-host',
+          type: 'config',
+          session: options.session || null,
+          bridgeKey: options.bridgeKey || null,
+        },
+        '*',
+      );
+
     // `/pay` is the canonical URL; Cloudflare's asset handling redirects
     // `/pay.html` to it, which would cost a round trip on every embed.
     const frame = document.createElement('iframe');
@@ -410,9 +531,7 @@
       const data = event.data;
       if (!data || data.source !== 'nepalpay-pay' || event.source !== frame.contentWindow) return;
 
-      if (data.type === 'ready' && options.session) {
-        frame.contentWindow.postMessage({ source: 'nepalpay-host', type: 'session', session: options.session }, '*');
-      }
+      if (data.type === 'ready') postConfig();
       if (data.type === 'renewed' && typeof options.onRenew === 'function') options.onRenew(data.session);
       if (data.type === 'paid' && typeof options.onPaid === 'function') options.onPaid(data);
       if (data.type === 'error' && typeof options.onError === 'function') options.onError(data);
@@ -425,7 +544,8 @@
       frame,
       /** Hand a (possibly renewed) session to the widget. */
       setSession(session) {
-        frame.contentWindow.postMessage({ source: 'nepalpay-host', type: 'session', session }, '*');
+        options.session = session;
+        postConfig();
       },
       destroy() {
         window.removeEventListener('message', onMessage);
@@ -434,13 +554,19 @@
     };
   }
 
-  /** Ask the hosted widget whether a QR has been paid — same contract as pay.html. */
-  function paymentStatus(client, options) {
-    const since = new Set((options && options.ignore) || []);
-    return client.recentTransactions().then((rows) => {
-      const list = Array.isArray(rows) ? rows : [];
-      const fresh = list.filter((txn) => txn.instructionId && !since.has(txn.instructionId));
-      return fresh.length ? { paid: true, transaction: fresh[0] } : { paid: false, checked: list.length };
+  /** Wait for `ms`, rejecting early when an AbortSignal fires. */
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) return reject(new Error('aborted'));
+      const timer = setTimeout(() => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      function onAbort() {
+        clearTimeout(timer);
+        reject(new Error('aborted'));
+      }
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
     });
   }
 
@@ -448,9 +574,9 @@
     version: VERSION,
     createClient,
     payWidget,
-    paymentStatus,
     NepalPayError,
     ROUTES,
     HELP,
+    BRIDGE_KEY_HEADER,
   };
 });
