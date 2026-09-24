@@ -290,6 +290,38 @@
       throw new FonepayError(envelope, result.httpStatus || result.status, '/api/auth/login');
     };
 
+    /**
+     * Adopt a token minted by a real browser (POST /api/auth/import).
+     *
+     * Fonepay's edge classifies the TLS client at sign-in and only issues usable
+     * tokens to real browsers, so a server-side login can come back
+     * `MINT_REJECTED`. Sign in at the fonepay portal yourself, read
+     * `sessionStorage.AccessToken` (and optionally `expireTime`), and hand them
+     * over here. Data calls accept the token from any client. Imported sessions
+     * never auto-renew — import again before the token expires.
+     */
+    client.importToken = async function (accessToken, importOptions) {
+      importOptions = importOptions || {};
+      const body = { accessToken: accessToken };
+      if (importOptions.expireTime !== undefined && importOptions.expireTime !== null) {
+        body.expireTime = importOptions.expireTime;
+      }
+      if (importOptions.expiresAt !== undefined && importOptions.expiresAt !== null) {
+        body.expiresAt = importOptions.expiresAt;
+      }
+      const data = await call('/api/auth/import', body);
+      client.session = data.session;
+      client.user = data.user;
+      client.pendingSession = null;
+      return {
+        session: data.session,
+        user: data.user,
+        expiresAt: data.expiresAt,
+        autoRenew: data.autoRenew,
+        verified: data.verified,
+      };
+    };
+
     /** Finish a sign-in that stopped at the one-time-code step. */
     client.submitOtp = async function (code, pendingSession) {
       const pending = pendingSession || client.pendingSession;

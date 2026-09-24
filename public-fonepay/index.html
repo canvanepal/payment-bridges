@@ -324,7 +324,7 @@ function signOut(silent) {
 
 /* ------------------------- sign-in gate ------------------------- */
 
-function renderGate(message) {
+function renderGate(message, openImport) {
   document.title = 'Corporate console · Fonepay bridge';
   $('app').innerHTML =
     '<div class="gate"><div class="card"><header><div class="brandline">' +
@@ -348,9 +348,21 @@ function renderGate(message) {
         '<button class="primary" id="gSubmit" onclick="signIn()">Sign in</button></div>' +
         '<div class="tight"><button onclick="document.getElementById(\'gPass\').value=\'\'">Clear</button></div>' +
       '</div>' +
+      '<details style="margin-top:12px;border-top:1px solid var(--line);padding-top:8px"' + (openImport ? ' open' : '') + '>' +
+        '<summary>Import a browser token <span class="faint">(when sign-in returns MINT_REJECTED)</span></summary>' +
+        '<div class="muted" style="font-size:12px;margin-top:8px">' +
+          'Fonepay\'s edge only issues usable tokens to real browsers — a server-side sign-in gets a ' +
+          'token its own data API refuses. Sign in at <b>fonebiz.fonepay.com</b> yourself, press ' +
+          '<b>F12 → Application → sessionStorage</b>, and paste <code>AccessToken</code> below ' +
+          '(the <code>expireTime</code> beside it is optional).</div>' +
+      '<div style="margin-top:8px"><input id="gImport" placeholder="eyJhbGciOi…" spellcheck="false" autocomplete="off" /></div>' +
+      '<div class="row" style="margin-top:8px"><div style="max-width:160px"><input id="gImportExp" placeholder="expireTime (optional)" inputmode="numeric" /></div>' +
+        '<div class="tight"><button onclick="importToken()" id="gImportBtn">Import token</button></div></div>' +
+      '</details>' +
       '<div class="muted" style="margin-top:14px;font-size:12px">' +
         'The bridge signs in to <code>corporate-kong.fonepay.com</code> on your behalf and hands back an ' +
-        'opaque session token. Your password is never returned to this page.</div>' +
+        'opaque session token. If Fonepay refuses the server-side sign-in (<code>MINT_REJECTED</code>), ' +
+        'use the import box above — data calls accept a browser-minted token from any client.</div>' +
       '<details style="margin-top:12px;border-top:1px solid var(--line);padding-top:8px">' +
         '<summary>What this bridge does and does not do</summary>' +
         '<div class="muted" style="font-size:12px;padding:0 12px 12px">' +
@@ -432,6 +444,11 @@ async function signIn() {
       renderOtp(error.data);
       return;
     }
+    if (error.code === 'MINT_REJECTED') {
+      renderGate(error.message, true);
+      toast('Fonepay refused the server-side sign-in — import a browser token instead.', true);
+      return;
+    }
     if (error.code === 'CORPORATE_SELECTION_REQUIRED') {
       const options = (error.data && error.data.corporateOptions) || [];
       if (options.length) {
@@ -451,6 +468,40 @@ async function signIn() {
   } finally {
     const button = $('gSubmit');
     if (button) { button.disabled = false; button.textContent = 'Sign in'; }
+  }
+}
+
+async function importToken() {
+  const accessToken = ($('gImport') && $('gImport').value || '').trim();
+  if (!accessToken) return toast('Paste the portal AccessToken first.', true);
+
+  // Same bridge-key handling as sign-in: it is the caller's identity, kept here.
+  if ($('gKey') && $('gKey').value.trim() !== S.bridgeKey) {
+    S.bridgeKey = $('gKey').value.trim();
+    try {
+      if (S.bridgeKey) localStorage.setItem('fp_bridge_key', S.bridgeKey);
+      else localStorage.removeItem('fp_bridge_key');
+    } catch { /* private mode */ }
+  }
+
+  const expireRaw = (($('gImportExp') && $('gImportExp').value) || '').trim();
+  const body = { accessToken };
+  if (expireRaw) body.expireTime = /^\d+$/.test(expireRaw) ? Number(expireRaw) : expireRaw;
+
+  const button = $('gImportBtn');
+  if (button) { button.disabled = true; button.textContent = 'Importing…'; }
+  try {
+    const result = await api('/auth/import', { body, allow401: true });
+    S.token = result.data.session;
+    S.user = result.data.user;
+    sessionStorage.setItem('fp_session', S.token);
+    sessionStorage.setItem('fp_user', JSON.stringify(S.user));
+    toast('Token imported' + (result.data.verified ? ' and verified upstream.' : ' (upstream check skipped).'));
+    render();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = 'Import token'; }
   }
 }
 

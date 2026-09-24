@@ -68,6 +68,60 @@ Fonepay gateway does not filter on client fingerprint. It does expect the
 portal's own `Origin`/`Referer`, which the bridge sends by default and which
 `FONEPAY_ORIGIN` overrides.
 
+## Sign-in can be refused: MINT_REJECTED
+
+Sign-in is only half the story. Fonepay's edge classifies the TLS client of the
+sign-in connection, and connections it does not recognise as a real browser get
+a *decoy*: a fresh, genuine token (HTTP 202) that the data API then refuses with
+`401 {"message":"Invalid token"}`.
+
+Established empirically against the live gateway:
+
+| client | login status | token usable on the data API |
+|---|---|---|
+| Chrome, real portal page | **200** | **yes** |
+| curl (Schannel), any headers, cookie chain, origin, UA, `sec-ch-ua*` | 202 | no |
+| Node fetch (OpenSSL), full browser header set | 202 | no |
+| Cloudflare Worker | 202 | no |
+
+Everything spoofable was varied and ruled out: user-agent, `Origin`, `Referer`,
+`sec-ch-ua*`, `sec-fetch-*`, `Accept-Language`, cookies (the browser sends
+none), HTTP version (the gateway offers no ALPN at all — everyone is
+HTTP/1.1), header set and request body (identical field-for-field). What is
+left is the TLS handshake itself, which a Worker cannot control. The token is
+*portable*, though: a Chrome-minted token replayed with curl answers
+`202 Linked merchants retrieved` — **data calls never classify the client,
+only sign-in does**.
+
+The bridge is built on both halves of that finding:
+
+- **The mint is verified.** The linked-merchants lookup that runs after sign-in
+doubles as a data-API probe; a 401 there turns the login into `401
+  MINT_REJECTED` with instructions, instead of handing out a session that dies
+  on its first call.
+- **Browser-minted tokens can be imported.** `POST /api/auth/import` adopts
+  `sessionStorage.AccessToken` from the merchant's own browser, optionally with
+  `expireTime` (seconds, as the gateway reports it) or `expiresAt` (epoch ms).
+  The token is verified the same way, sessions are flagged `imported`, and
+  because they hold no credentials they never attempt re-sign-in: when the
+  token dies, a fresh one is imported. With no lifetime supplied, 8 hours is
+  assumed — deliberately short of the observed 8 h 40 m.
+
+To get a token: sign in at the fonepay portal, open DevTools (F12) →
+Application → sessionStorage → copy `AccessToken` (and `expireTime`). The
+console's sign-in gate has an import box that appears automatically on
+`MINT_REJECTED`; the SDK exposes `client.importToken(token, { expireTime })`.
+
+Two operational notes from live testing. **Every sign-in revokes earlier
+tokens** — a rejected server-side attempt included — so once a session is
+imported, interleaving password logins will kill it; re-import when a session
+dies with `401 "Please Login Again"`. And the portal calls
+`configuration-util/front-end-idle-time` on a timer, so keeping imported
+sessions warm with an occasional data call is the conservative habit. The
+gateway also occasionally hangs a call for 20+ seconds (seen on `qr/dynamic`
+and `linked-merchants` from Cloudflare's egress); the bridge turns that into an
+honest `504` naming the path rather than letting it eat the request.
+
 ## There is no refresh endpoint
 
 This is the finding that shaped the bridge.
@@ -208,13 +262,16 @@ Deploy with `npm run deploy:fonepay`, develop with `npm run dev:fonepay`.
 ## Verification
 
 `npm run test:e2e:fonepay` drives the real Worker against a local mock gateway —
-**102 checks**, including: sign-in with and without a corporate code, multiple
+**117 checks**, including: sign-in with and without a corporate code, multiple
 corporate accounts, `firstLogin`, the OTP hand-off, opaque auth failures, the
 `202` pass-through, merchant scoping refusal, proactive renewal, recovery from an
 expired token, recovery from a token the *server* invalidated, failing closed when
-renewal is off, the throttle, the CORS preflight, and the account-scoped cache
+renewal is off, the throttle, the CORS preflight, the account-scoped cache
 answering a reference route a second time as `X-Bridge-Cache: HIT` with no
-further gateway call.
+further gateway call, a decoy mint reported as `MINT_REJECTED` at login, and
+browser-token import — accepted, refused and expired variants. Both QR mints
+prove the required sub-merchant/terminal pair is resolved from the hierarchy
+when the caller omits it, and that the hierarchy is then cached.
 
 `npm test` adds unit coverage for `expireTime` interpretation, login-response
 parsing, the linked-merchant shape and the request builder.

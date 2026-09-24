@@ -113,6 +113,13 @@ export interface FonepaySession extends SealedSession {
   credentials: StoredCredentials;
   /** Epoch ms of the most recent successful re-sign-in. */
   renewedAt?: number;
+  /**
+   * True when the token was minted in a real browser and imported via
+   * POST /api/auth/import rather than signed in here. Imported sessions hold no
+   * credentials, so they can never re-sign-in — they simply expire and a fresh
+   * token is imported.
+   */
+  imported?: boolean;
 }
 
 /** A sign-in that stopped short of a session because an OTP is required. */

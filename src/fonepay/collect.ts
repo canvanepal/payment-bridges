@@ -27,7 +27,7 @@ import {
   type CollectTicket,
 } from '../shared/collect';
 import { cacheGet, cachePut, defaultCache } from '../shared/kvcache';
-import { apiBase, callUpstream, payloadOf, str } from './client';
+import { apiOrigin, callUpstream, defaultMerchantId, payloadOf, str } from './client';
 import { buildFonepayRequest, QR_DYNAMIC_SPEC, ScopeError, TRANSACTIONS_SPEC } from './routes';
 import type { Env, FonepaySession } from './types';
 
@@ -107,6 +107,68 @@ function findMatch(rows: unknown[], ticket: CollectTicket, values: string[]): Ma
   return null;
 }
 
+/** How long a resolved sub-merchant/terminal pair is reused per merchant. */
+const QR_TARGET_TTL_SECONDS = 600;
+
+/**
+ * The sub-merchant and terminal a QR must name, resolved the way the portal
+ * resolves them: from `linked-merchants/{id}/hierarchy`, preferring each
+ * `isDefault` entry and an ACTIVE terminal. The gateway rejects a QR without
+ * `SubMerchantId`, and these ids exist nowhere else, so callers that omit them
+ * get the defaults. A failed lookup resolves to nothing — the caller's body is
+ * left as built and the gateway's own validation error passes through.
+ */
+export async function resolveQrTargets(
+  env: Env,
+  session: FonepaySession,
+  merchantId: string,
+  hintSub?: unknown,
+): Promise<{ subMerchantId?: number | string; terminalId?: number | string }> {
+  if (!merchantId) return {};
+
+  const cache = defaultCache();
+  const cacheKey = `qrtarget/${merchantId}`;
+  type Hierarchy = { subMerchants?: Array<Record<string, unknown>> };
+  let data: Hierarchy | null = cache ? await cacheGet<Hierarchy>(cache, cacheKey) : null;
+
+  if (!data) {
+    const result = await callUpstream({
+      baseUrl: apiOrigin(env),
+      path: `/corporate/api/v1/merchant-collection/linked-merchants/${merchantId}/hierarchy`,
+      method: 'GET',
+      accessToken: session.accessToken,
+      env,
+    });
+    if (!result.ok) return {};
+    data = payloadOf(result.body) as Hierarchy;
+    if (cache) await cachePut(cache, cacheKey, data, QR_TARGET_TTL_SECONDS);
+  }
+
+  const subs = Array.isArray(data.subMerchants) ? data.subMerchants : [];
+  if (subs.length === 0) return {};
+
+  const hint = str(hintSub);
+  const sub =
+    (hint ? subs.find((candidate) => str(candidate.id) === hint) : undefined) ??
+    subs.find((candidate) => candidate.isDefault === true) ??
+    subs[0];
+
+  const terminals = Array.isArray(sub?.terminals)
+    ? (sub.terminals as Array<Record<string, unknown>>)
+    : [];
+  const terminal =
+    terminals.find((t) => t.isDefault === true && t.status === 'ACTIVE') ??
+    terminals.find((t) => t.status === 'ACTIVE') ??
+    terminals[0];
+
+  const targets: { subMerchantId?: number | string; terminalId?: number | string } = {};
+  if (sub?.id !== undefined && sub?.id !== null) targets.subMerchantId = sub.id as number | string;
+  if (terminal?.id !== undefined && terminal?.id !== null) {
+    targets.terminalId = terminal.id as number | string;
+  }
+  return targets;
+}
+
 /** Mint a dynamic QR for `amount` and seal a ticket describing the wait. */
 export async function startCollect(options: {
   env: Env;
@@ -145,8 +207,24 @@ export async function startCollect(options: {
     throw error;
   }
 
+  // The gateway requires a sub-merchant and terminal on every dynamic QR.
+  if (request.body && (!str(request.body.subMerchantId) || !str(request.body.terminalId))) {
+    const targets = await resolveQrTargets(
+      options.env,
+      session,
+      str(options.input.merchantId) || defaultMerchantId(session),
+      request.body.subMerchantId,
+    );
+    if (targets.subMerchantId !== undefined && !str(request.body.subMerchantId)) {
+      request.body.subMerchantId = targets.subMerchantId;
+    }
+    if (targets.terminalId !== undefined && !str(request.body.terminalId)) {
+      request.body.terminalId = targets.terminalId;
+    }
+  }
+
   const result = await callUpstream({
-    baseUrl: apiBase(options.env),
+    baseUrl: apiOrigin(options.env),
     path: `${request.path}${request.query}`,
     method: QR_DYNAMIC_SPEC.method,
     body: request.body,
@@ -262,7 +340,7 @@ export async function collectStatus(options: {
   }
 
   const result = await callUpstream({
-    baseUrl: apiBase(options.env),
+    baseUrl: apiOrigin(options.env),
     path: `${request.path}${request.query}`,
     method: TRANSACTIONS_SPEC.method,
     body: request.body,

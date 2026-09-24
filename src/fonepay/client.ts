@@ -41,6 +41,20 @@ export function apiBase(env: Env): string {
   return normalizeBase(env.FONEPAY_API_BASE_URL, DEFAULT_API_BASE_URL);
 }
 
+/**
+ * Origin of the data gateway, with no path — for upstream paths that are
+ * already written in full (`/corporate/api/...`, as every FONEPAY_ROUTES entry
+ * is). Appending such a path to `apiBase`, which itself ends in
+ * `/corporate/api`, would double the prefix and every data call would404.
+ */
+export function apiOrigin(env: Env): string {
+  try {
+    return new URL(apiBase(env)).origin;
+  } catch {
+    return 'https://corporate-kong.fonepay.com';
+  }
+}
+
 export function authBase(env: Env): string {
   return normalizeBase(env.FONEPAY_AUTH_BASE_URL, DEFAULT_AUTH_BASE_URL);
 }
@@ -100,17 +114,40 @@ export async function callUpstream(options: {
 }): Promise<UpstreamResult> {
   const method = options.method ?? (options.body === undefined ? 'GET' : 'POST');
 
-  const response = await fetch(`${normalizeBase(options.baseUrl, '')}${options.path}`, {
-    method,
-    headers: upstreamHeaders({
-      env: options.env,
-      hasBody: options.body !== undefined,
-      accessToken: options.accessToken,
-    }),
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    redirect: 'manual',
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${normalizeBase(options.baseUrl, '')}${options.path}`, {
+      method,
+      headers: upstreamHeaders({
+        env: options.env,
+        hasBody: options.body !== undefined,
+        accessToken: options.accessToken,
+      }),
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // A timeout or unreachable network must come back as a result, never as a
+    // thrown error: an unhandled throw makes Hono answer with a plain-text 500
+    // that callers (and the console) cannot read as JSON.
+    const name = error instanceof Error ? error.name : '';
+    const timedOut = name === 'TimeoutError' || name === 'AbortError';
+    const detail = error instanceof Error ? error.message : String(error);
+    const where = `${options.method ?? (options.body === undefined ? 'GET' : 'POST')} ${options.path.split('?')[0]}`;
+    return {
+      status: timedOut ? 504 : 502,
+      body: null,
+      raw: timedOut
+        ? `${where}: upstream timed out after ${UPSTREAM_TIMEOUT_MS / 1000}s.`
+        : `Could not reach Fonepay (${where}): ${detail}`,
+      contentType: '',
+      ok: false,
+      message: timedOut
+        ? `${where} did not answer within ${UPSTREAM_TIMEOUT_MS / 1000} seconds.`
+        : `Could not reach Fonepay (${where}): ${detail}`,
+    };
+  }
 
   const raw = await response.text();
   const contentType = response.headers.get('content-type') ?? '';

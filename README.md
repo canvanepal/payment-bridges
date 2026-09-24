@@ -222,7 +222,7 @@ unlinked ones with `400 INVALID_REQUEST`.
 different problems with different fixes, so they get different codes: `401
 AUTH_FAILED`, `502 UPSTREAM_BLOCKED` (NepalPay's edge), `502 UPSTREAM_FAILED`,
 `401 SESSION_EXPIRED`, `429 RATE_LIMITED`, `409 OTP_REQUIRED`,
-`401 BRIDGE_KEY_REQUIRED`.
+`401 BRIDGE_KEY_REQUIRED`, `401 MINT_REJECTED`.
 
 **Renewal is de-duplicated.** Sessions are stateless, so nothing inherently stops
 twenty concurrent requests that notice the same near-expiry token from performing
@@ -230,6 +230,15 @@ twenty renewals — and on Fonepay every one of those is a real sign-in with the
 stored password. An in-isolate map plus a 30-second cache entry collapses a burst
 into a single upstream call, and `style: "shared"` tells you when a renewal was
 reused rather than performed.
+
+**Fonepay sign-ins are classified by TLS fingerprint.** The gateway's edge
+decides at sign-in whether the connection looks like a real browser; connections
+it does not recognise receive a decoy — a fresh, genuine token (HTTP 202) that
+its own data API then refuses with `401 "Invalid token"`. Headers can be spoofed,
+the TLS handshake cannot, so a Worker can never pass. The bridge verifies the
+mint on the first data call and fails honestly as `401 MINT_REJECTED` instead of
+handing out a dead session; `POST /api/auth/import` then adopts a token minted
+in the merchant's own browser — data calls accept it from any client.
 
 **Reference data is reused, not re-fetched.** Bank lists, refund reasons, role
 names and Fonepay's filter tree change rarely, yet a portal re-reads them on
@@ -250,7 +259,7 @@ matching window — so bare local strings are pinned to `+05:45`.
 npm run typecheck          # tsc --noEmit
 npm test                   # 210 checks — crypto, clients, matching, cache, throttle
 npm run test:e2e           #  67 checks — NepalPay Worker against a mock portal
-npm run test:e2e:fonepay   # 102 checks — Fonepay Worker against a mock gateway
+npm run test:e2e:fonepay   # 117 checks — Fonepay Worker against a mock gateway
 npm run test:all           # everything (CI runs exactly this, plus a dry-run build)
 ```
 

@@ -11,9 +11,10 @@ import { REF_CACHE_HEADER, withRefCache } from '../shared/refcache';
 import { renewOnce } from '../shared/renewal';
 import { BRIDGE_KEY_HEADER, bridgeKeyOf, requireBridgeKey } from '../shared/bridge-key';
 import { COLLECT_RETRY_AFTER_MS, openTicket, sealTicket } from '../shared/collect';
-import { collectStatus, startCollect } from './collect';
+import { collectStatus, resolveQrTargets, startCollect } from './collect';
 import {
   apiBase,
+  apiOrigin,
   authBase,
   callUpstream,
   clientCode,
@@ -23,9 +24,10 @@ import {
   expiryFromLogin,
   extractLinkedMerchants,
   extractLoginData,
+  defaultMerchantId,
   str,
 } from './client';
-import { buildFonepayRequest, FONEPAY_ROUTES, ScopeError } from './routes';
+import { buildFonepayRequest, FONEPAY_ROUTES, QR_DYNAMIC_SPEC, ScopeError } from './routes';
 import type {
   Env,
   FonepayPendingSession,
@@ -269,23 +271,60 @@ function buildSession(options: {
   };
 }
 
-/** Best-effort lookup of the merchants this session may read. */
-async function loadLinkedMerchants(env: Env, session: FonepaySession): Promise<FonepaySession> {
+/** Result of checking a freshly minted token against the data API. */
+type MintVerdict = 'verified' | 'rejected' | 'unverified';
+
+/**
+ * Best-effort lookup of the merchants this session may read — which doubles as
+ * the first data-API call of the session, i.e. a check that the gateway accepts
+ * the token at all. Fonepay's edge classifies the TLS client at sign-in and
+ * hands non-browser connections a token the data API refuses (HTTP 401 "Invalid
+ * token"), so this is where a decoy mint gets caught.
+ */
+async function loadLinkedMerchants(
+  env: Env,
+  session: FonepaySession,
+): Promise<{ session: FonepaySession; mint: MintVerdict }> {
   try {
     const result = await callUpstream({
-      baseUrl: apiBase(env),
+      baseUrl: apiOrigin(env),
       path: '/corporate/api/v1/merchant-collection/linked-merchants',
       method: 'GET',
       accessToken: session.accessToken,
       env,
     });
-    if (!result.ok) return session;
+    if (result.status === 401 || result.status === 403) return { session, mint: 'rejected' };
+    if (!result.ok) return { session, mint: 'unverified' };
     const merchants = extractLinkedMerchants(result.body);
-    return merchants.length > 0 ? { ...session, linkedMerchants: merchants } : session;
+    return {
+      session: merchants.length > 0 ? { ...session, linkedMerchants: merchants } : session,
+      mint: 'verified',
+    };
   } catch {
     // A missing list only costs the scope check, never the session.
-    return session;
+    return { session, mint: 'unverified' };
   }
+}
+
+/**
+ * The honest failure for a sign-in whose token the data API will not accept.
+ *
+ * Fonepay's edge classifies the TLS client of the sign-in connection and only
+ * real browsers get a usable token; headers can be spoofed, the TLS handshake
+ * cannot — so a Worker can never mint one. The token must come from a real
+ * browser via POST /api/auth/import: data calls accept it from any client.
+ */
+function mintRejectedBody() {
+  return {
+    ...errorBody(
+      'MINT_REJECTED',
+      "Fonepay's edge issued this sign-in a token that its data API refuses (HTTP 401 \"Invalid token\") — " +
+        'it classifies the TLS client at sign-in and only real browsers get a usable token. Sign in ' +
+        'through the fonepay portal in a browser, copy AccessToken from sessionStorage, and import it ' +
+        'with POST /api/auth/import. See docs/fonepay-bridge.md.',
+    ),
+    data: { importEndpoint: 'POST /api/auth/import', fields: ['accessToken', 'expireTime?'] },
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -294,6 +333,11 @@ async function loadLinkedMerchants(env: Env, session: FonepaySession): Promise<F
 
 function renewEnabled(env: Env): boolean {
   return env.FONEPAY_RENEW_ON_EXPIRY !== '0';
+}
+
+/** Only sessions that hold credentials can re-sign-in; imported ones cannot. */
+function canRenew(session: FonepaySession): boolean {
+  return Boolean(session.credentials?.password);
 }
 
 /**
@@ -308,6 +352,7 @@ async function renewSession(
   session: FonepaySession,
 ): Promise<{ session: FonepaySession; sealed: string } | null> {
   if (!renewEnabled(env)) return null;
+  if (!canRenew(session)) return null;
 
   // Renewal here is a *real sign-in with the stored password*, so a burst of
   // concurrent requests noticing the same expiry must not become a burst of
@@ -391,9 +436,11 @@ const requireSession = createMiddleware<AppEnv>(async (c, next) => {
       return c.json(
         errorBody(
           'SESSION_EXPIRED',
-          renewEnabled(c.env)
-            ? 'The Fonepay token expired and re-signing in failed. Sign in again.'
-            : 'The Fonepay token expired and renewal is disabled. Sign in again.',
+          !canRenew(session)
+            ? 'This session was imported and cannot re-sign-in. Import a fresh token (POST /api/auth/import).'
+            : renewEnabled(c.env)
+              ? 'The Fonepay token expired and re-signing in failed. Sign in again.'
+              : 'The Fonepay token expired and renewal is disabled. Sign in again.',
         ),
         401,
       );
@@ -472,14 +519,17 @@ app.post('/api/auth/login', async (c) => {
     );
   }
 
-  const session = await loadLinkedMerchants(c.env, outcome.session);
+  const { session, mint } = await loadLinkedMerchants(c.env, outcome.session);
+  if (mint === 'rejected') return c.json(mintRejectedBody(), 401);
+
   const sealed = await sealSession(session, c.env.SESSION_SECRET);
 
   return c.json(
     successBody('Signed in to Fonepay.', {
       session: sealed,
       expiresAt: session.accessExpiresAt,
-      autoRenew: renewEnabled(c.env),
+      autoRenew: renewEnabled(c.env) && canRenew(session),
+      mint,
       user: {
         username: session.username,
         corporateCode: session.corporateCode,
@@ -561,7 +611,7 @@ app.post('/api/auth/otp', async (c) => {
     );
   }
 
-  const session = await loadLinkedMerchants(
+  const { session, mint } = await loadLinkedMerchants(
     c.env,
     buildSession({
       env: c.env,
@@ -571,6 +621,7 @@ app.post('/api/auth/otp', async (c) => {
       signedInAt: Date.now(),
     }),
   );
+  if (mint === 'rejected') return c.json(mintRejectedBody(), 401);
 
   const sealed = await sealSession(session, c.env.SESSION_SECRET);
 
@@ -578,7 +629,8 @@ app.post('/api/auth/otp', async (c) => {
     successBody('Signed in to Fonepay.', {
       session: sealed,
       expiresAt: session.accessExpiresAt,
-      autoRenew: renewEnabled(c.env),
+      autoRenew: renewEnabled(c.env) && canRenew(session),
+      mint,
       user: {
         username: session.username,
         corporateCode: session.corporateCode,
@@ -603,7 +655,8 @@ app.get('/api/auth/me', requireSession, (c) => {
       expiresAt: session.accessExpiresAt,
       signedInAt: session.signedInAt,
       renewedAt: session.renewedAt ?? null,
-      autoRenew: renewEnabled(c.env),
+      imported: session.imported === true,
+      autoRenew: renewEnabled(c.env) && canRenew(session),
     }),
   );
 });
@@ -617,7 +670,18 @@ app.post('/api/auth/refresh', requireSession, async (c) => {
     );
   }
 
-  const renewed = await renewSession(c.env, c.get('session'));
+  const session = c.get('session');
+  if (!canRenew(session)) {
+    return c.json(
+      errorBody(
+        'REFRESH_UNAVAILABLE',
+        'Imported sessions hold no credentials and cannot re-sign-in. Import a fresh token (POST /api/auth/import).',
+      ),
+      409,
+    );
+  }
+
+  const renewed = await renewSession(c.env, session);
   if (!renewed) {
     return c.json(
       errorBody('REFRESH_FAILED', 'Fonepay rejected the stored credentials. Sign in again.'),
@@ -638,6 +702,84 @@ app.post('/api/auth/refresh', requireSession, async (c) => {
 app.post('/api/auth/logout', (c) =>
   c.json(successBody('Session discarded. Delete the token on the client.', null)),
 );
+
+/**
+ * Hand the bridge a token minted by a real browser.
+ *
+ * Server-side sign-in cannot produce a usable token (see mintRejectedBody), but
+ * data calls accept the token from *any* client — so the portal's own browser
+ * mints it and this route adopts it. Imported sessions hold no credentials and
+ * are flagged `imported`, so they never attempt re-sign-in: when the token's
+ * lifetime ends the caller imports a fresh one.
+ *
+ * `accessToken` is the portal's sessionStorage `AccessToken`. `expireTime`
+ * accepts what the gateway reports (seconds) or an epoch; `expiresAt` accepts
+ * epoch ms. When no lifetime is given, the observed 8.67 h is assumed, rounded
+ * down to 8 h so the session dies before the token does.
+ */
+app.post('/api/auth/import', async (c) => {
+  if (!c.env.SESSION_SECRET) return c.json(secretMissing(), 500);
+
+  const body = await readJsonBody(c);
+  const accessToken = str(body.accessToken).trim();
+  if (!accessToken.startsWith('eyJ')) {
+    return c.json(
+      errorBody(
+        'INVALID_REQUEST',
+        'accessToken must be the Fonepay JWE from the portal session (sessionStorage AccessToken).',
+      ),
+      400,
+    );
+  }
+
+  const signedInAt = Date.now();
+  const expireRaw =
+    body.expiresAt !== undefined && body.expiresAt !== null
+      ? body.expiresAt
+      : body.expireTime !== undefined && body.expireTime !== null
+        ? body.expireTime
+        : 8 * 3600;
+
+  const candidate: FonepaySession = {
+    v: 1,
+    provider: 'fonepay',
+    accessToken,
+    refreshToken: '',
+    tempToken: '',
+    accessExpiresAt:
+      expiryFromLogin({ accessToken, expireTime: expireRaw as number | string }, signedInAt) -
+      EXPIRY_SKEW_MS,
+    signedInAt,
+    username: str(body.username, str(body.email)).trim(),
+    corporateCode: str(body.corporateCode).trim(),
+    userId: str(body.userId),
+    displayName: str(body.displayName, str(body.username, 'Imported session')),
+    otpType: '',
+    linkedMerchants: [],
+    credentials: { emailOrUsername: '', password: '' },
+    imported: true,
+  };
+
+  const { session, mint } = await loadLinkedMerchants(c.env, candidate);
+  if (mint === 'rejected') return c.json(mintRejectedBody(), 401);
+
+  const sealed = await sealSession(session, c.env.SESSION_SECRET);
+  return c.json(
+    successBody('Token imported. The bridge will proxy data calls with it until it expires.', {
+      session: sealed,
+      expiresAt: session.accessExpiresAt,
+      autoRenew: false,
+      mint: 'imported',
+      verified: mint === 'verified',
+      user: {
+        username: session.username,
+        corporateCode: session.corporateCode,
+        userId: session.userId,
+        linkedMerchants: session.linkedMerchants,
+      },
+    }),
+  );
+});
 
 /* ------------------------------------------------------------------ */
 /* Collect — take a payment and learn when it lands                     */
@@ -750,9 +892,35 @@ for (const spec of FONEPAY_ROUTES) {
       throw error;
     }
 
+    // A dynamic QR needs the sub-merchant and terminal the gateway requires;
+    // resolve the portal's defaults when the caller omitted them. The static
+    // QR names the same pair in its query string instead of the body.
+    const merchantId = str(incoming.merchantId) || defaultMerchantId(session);
+    if (spec.path === QR_DYNAMIC_SPEC.path && request.body &&
+        (!str(request.body.subMerchantId) || !str(request.body.terminalId))) {
+      const targets = await resolveQrTargets(c.env, session, merchantId, request.body.subMerchantId);
+      if (targets.subMerchantId !== undefined && !str(request.body.subMerchantId)) {
+        request.body.subMerchantId = targets.subMerchantId;
+      }
+      if (targets.terminalId !== undefined && !str(request.body.terminalId)) {
+        request.body.terminalId = targets.terminalId;
+      }
+    } else if (spec.path === '/qr/static' &&
+               (!request.query.includes('subMerchantId=') || !request.query.includes('terminalId='))) {
+      const targets = await resolveQrTargets(c.env, session, merchantId);
+      const extras: string[] = [];
+      if (targets.subMerchantId !== undefined && !request.query.includes('subMerchantId=')) {
+        extras.push(`subMerchantId=${encodeURIComponent(String(targets.subMerchantId))}`);
+      }
+      if (targets.terminalId !== undefined && !request.query.includes('terminalId=')) {
+        extras.push(`terminalId=${encodeURIComponent(String(targets.terminalId))}`);
+      }
+      if (extras.length) request.query += (request.query ? '&' : '?') + extras.join('&');
+    }
+
     const call = async (activeSession: FonepaySession) =>
       callUpstream({
-        baseUrl: apiBase(c.env),
+        baseUrl: apiOrigin(c.env),
         path: `${request.path}${request.query}`,
         method: spec.method,
         body: request.body,

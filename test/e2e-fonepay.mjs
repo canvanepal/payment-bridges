@@ -35,6 +35,11 @@ const state = {
   paidAmount: 0,
 };
 
+/** A token presented by the import route: the mock gateway accepts it. */
+const IMPORTED_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.mock-imported-token';
+/** Right shape, but the mock gateway refuses it — Fonepay's decoy mints. */
+const REJECTED_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.mock-rejected-token';
+
 const issueToken = (label) => {
   state.counter += 1;
   const token = `tok-${state.counter}-${label}`;
@@ -87,6 +92,8 @@ const server = createServer(async (req, res) => {
       send(401, { message: 'Unauthorized', success: false });
       return false;
     }
+    // An imported browser token is valid but is not any login's "current" token.
+    if (auth.slice(7) === IMPORTED_TOKEN) return true;
     if (auth.slice(7) !== state.currentToken) {
       send(401, { message: 'Token expired', success: false });
       return false;
@@ -95,6 +102,13 @@ const server = createServer(async (req, res) => {
   };
 
   /* --- auth -------------------------------------------------------- */
+
+  // A doubled base (…/corporate/api/corporate/api/…) must fail loudly: the
+  // endswith matching below would otherwise silently accept it and mask exactly
+  // the bug that shipped once already.
+  if (path.includes('/corporate/api/corporate/api/') || path.includes('/corporate/auth/authentication/corporate/')) {
+    return send(500, { message: 'doubled base path: ' + path, code: 'MOCK_BAD_URL', isSuccess: false });
+  }
 
   if (path.endsWith('/authentication/email-lookup')) {
     const username = String(body.emailOrUsername ?? '');
@@ -161,8 +175,13 @@ const server = createServer(async (req, res) => {
   /* --- data -------------------------------------------------------- */
 
   if (path.endsWith('/merchant-collection/linked-merchants')) {
-    if (!requireToken()) return;
-    return send(202, envelope([
+    const bare = auth.replace(/^Bearer\s+/i, '');
+    // Fonepay's mint classifier, reproduced: a token from a "decoy" sign-in,
+    // or a deliberately refused import, gets the data API's 401.
+    if (/decoy/.test(bare) || bare === REJECTED_TOKEN) {
+      return send(401, { message: 'Invalid token', code: '1', isSuccess: false });
+    }
+    const merchants = [
       {
         id: 2000001,
         fonepayPan: '2222999900000001',
@@ -173,7 +192,11 @@ const server = createServer(async (req, res) => {
         totalCollections: 0,
         totalTransactions: 0,
       },
-    ], 'Linked merchants retrieved'));
+    ];
+    // An imported browser token is valid but is not the mock's "current" login.
+    if (bare === IMPORTED_TOKEN) return send(202, envelope(merchants, 'Linked merchants retrieved'));
+    if (!requireToken()) return;
+    return send(202, envelope(merchants, 'Linked merchants retrieved'));
   }
 
   if (path.endsWith('/collections/transactions/summary')) {
@@ -223,12 +246,51 @@ const server = createServer(async (req, res) => {
     }, 'Transactions retrieved'));
   }
 
-  if (path.endsWith('/qr/dynamic')) {
+  // The portal's default sub-merchant/terminal pair, as linked-merchants/{id}/hierarchy returns it.
+  if (/\/merchant-collection\/linked-merchants\/[^/]+\/hierarchy$/.test(path)) {
     if (!requireToken()) return;
     return send(202, envelope({
       success: true,
+      merchantId: 211298,
+      subMerchants: [
+        {
+          id: 209909,
+          name: 'Default Example Farm',
+          address: 'NA',
+          location: 'NA',
+          isDefault: true,
+          terminals: [
+            { id: 214093, name: 'Example Farm', status: 'ACTIVE', isDefault: true, fonepayPan: '2222999900000001' },
+          ],
+        },
+      ],
+    }, 'Merchant hierarchy retrieved'));
+  }
+
+  if (path.endsWith('/qr/generate')) {
+    if (!requireToken()) return;
+    // The real gateway requires both, in the query string.
+    if (!query.includes('subMerchantId=')) return send(400, { message: 'SubMerchantId is required', code: 'VALIDATION_ERROR', isSuccess: false });
+    if (!query.includes('terminalId=')) return send(400, { message: 'TerminalId is required', code: 'VALIDATION_ERROR', isSuccess: false });
+    return send(202, envelope({
+      success: true,
+      merchantId: 211298,
+      terminalId: 214093,
+      qrString: '00020101021126350011fonepay.comMOCKSTATIC',
+      terminalName: 'Example Farm',
+    }, 'Static QR code generated'));
+  }
+
+  if (path.endsWith('/qr/dynamic')) {
+    if (!requireToken()) return;
+    // The real gateway requires both, in the body.
+    if (!body.subMerchantId) return send(400, { message: 'SubMerchantId is required', code: 'VALIDATION_ERROR', isSuccess: false });
+    if (!body.terminalId) return send(400, { message: 'TerminalId is required', code: 'VALIDATION_ERROR', isSuccess: false });
+    return send(202, envelope({
+      success: true,
       merchantId: 210001,
-      terminalId: 214001,
+      terminalId: body.terminalId,
+      subMerchantId: body.subMerchantId,
       qrMessage: '00020101021226570011fonepay.com',
       amount: body.amount,
       orderId: body.orderId,
@@ -278,7 +340,7 @@ globalThis.caches = {
     },
     put: async (request, response) => {
       const key = new URL(request.url).pathname;
-      if (key.startsWith('/ref/')) refStore.set(key, await response.text());
+      if (key.startsWith('/ref/') || key.startsWith('/qrtarget/')) refStore.set(key, await response.text());
     },
   },
 };
@@ -692,6 +754,138 @@ check(
   'five parallel expired calls re-sign-in once',
   burstLoginsAfter - burstLoginsBefore === 1,
   String(burstLoginsAfter - burstLoginsBefore),
+);
+
+/* ------------------------------------------------------------------ */
+/* Fonepay's mint classifier and the browser-token import              */
+/* ------------------------------------------------------------------ */
+
+// A non-browser sign-in gets a token the data API refuses; the bridge must say
+// so at login time instead of handing out a session that dies on first use.
+const decoy = await login('decoy@example.com');
+check(
+  'a token the data API refuses is reported as MINT_REJECTED',
+  decoy.status === 401 && decoy.code === 'MINT_REJECTED',
+  `${decoy.status} ${decoy.code}`,
+);
+check(
+  'the MINT_REJECTED reply points at the import route',
+  String(decoy.body.message ?? '').includes('/api/auth/import'),
+);
+
+const importJson = (payload) =>
+  call('/api/auth/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+const rejectedImport = await importJson({ accessToken: REJECTED_TOKEN });
+check(
+  'importing a token the gateway refuses fails honestly',
+  rejectedImport.status === 401 && (await rejectedImport.json()).code === 'MINT_REJECTED',
+  String(rejectedImport.status),
+);
+
+const sillyImport = await importJson({ accessToken: 'not-a-token' });
+check(
+  'importing something that is not a token is refused',
+  sillyImport.status === 400 && (await sillyImport.json()).code === 'INVALID_REQUEST',
+  String(sillyImport.status),
+);
+
+const goodImport = await importJson({
+  accessToken: IMPORTED_TOKEN,
+  expireTime: 31200,
+  corporateCode: '1000001',
+  username: 'operator@example.com',
+});
+const goodImportBody = await goodImport.json();
+check(
+  'a browser-minted token imports',
+  goodImport.status === 200 && goodImportBody.status === 'SUCCESS',
+  `${goodImport.status} ${goodImportBody.code ?? ''}`,
+);
+check('imported sessions never auto-renew', goodImportBody.data?.autoRenew === false);
+check('the import verified the token upstream', goodImportBody.data?.verified === true);
+
+const importedSession = goodImportBody.data?.session;
+const importedMeBody = await (
+  await call('/api/auth/me', { headers: { Authorization: `Bearer ${importedSession}` } })
+).json();
+check('the imported session identifies as imported', importedMeBody.data?.imported === true);
+check('me reports autoRenew off for an imported session', importedMeBody.data?.autoRenew === false);
+
+const importedData = await call('/api/merchants', {
+  headers: { Authorization: `Bearer ${importedSession}` },
+});
+check('an imported session drives data calls', importedData.status === 202, String(importedData.status));
+
+// A dynamic QR with no sub-merchant/terminal: the bridge resolves the portal's
+// defaults from the hierarchy — and caches that hierarchy.
+const targetCalls = () => countPath('/linked-merchants/2000001/hierarchy');
+const targetsBefore = targetCalls();
+
+const qrMint = await call('/api/qr/dynamic', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${importedSession}` },
+  body: JSON.stringify({ amount: 5, remarks: 'e2e default targets', orderId: 'E2E-QR-1' }),
+});
+const qrMintBody = await qrMint.json();
+check(
+  'a dynamic QR resolves the default sub-merchant and terminal',
+  qrMint.status === 202 &&
+    qrMintBody.data?.subMerchantId === 209909 &&
+    qrMintBody.data?.terminalId === 214093,
+  `${qrMint.status} ${qrMintBody.data?.subMerchantId}/${qrMintBody.data?.terminalId}`,
+);
+
+await call('/api/qr/dynamic', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${importedSession}` },
+  body: JSON.stringify({ amount: 5, remarks: 'e2e cached targets', orderId: 'E2E-QR-2' }),
+});
+// The collect flow above already resolved this merchant's targets, so the
+// cache is warm: these mints must not add hierarchy calls at all.
+check(
+  'the hierarchy behind those defaults is cached',
+  targetCalls() === targetsBefore,
+  String(targetCalls() - targetsBefore),
+);
+
+const staticQr = await call('/api/qr/static', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${importedSession}` },
+});
+check('a static QR resolves the defaults into its query', staticQr.status === 202, String(staticQr.status));
+
+const importedRefresh = await call('/api/auth/refresh', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${importedSession}` },
+});
+const importedRefreshBody = await importedRefresh.json();
+check(
+  'refreshing an imported session says why it cannot',
+  importedRefresh.status === 409 && importedRefreshBody.code === 'REFRESH_UNAVAILABLE',
+  `${importedRefresh.status} ${importedRefreshBody.code}`,
+);
+
+// An imported session whose token is already dead must explain itself rather
+// than attempt a re-sign-in with credentials it never had.
+const deadImport = await importJson({ accessToken: IMPORTED_TOKEN, expiresAt: Date.now() - 60_000 });
+const deadImportBody = await deadImport.json();
+const deadSession = deadImportBody.data?.session;
+const deadCall = deadSession
+  ? await call('/api/merchants', { headers: { Authorization: `Bearer ${deadSession}` } })
+  : null;
+const deadCallBody = deadCall ? await deadCall.json() : {};
+check(
+  'an expired imported session explains how to renew itself',
+  deadCall !== null &&
+    deadCall.status === 401 &&
+    deadCallBody.code === 'SESSION_EXPIRED' &&
+    /import a fresh token/i.test(String(deadCallBody.message)),
+  deadCall ? `${deadCall.status} ${deadCallBody.code}` : 'no session',
 );
 
 /* ------------------------------------------------------------------ */
